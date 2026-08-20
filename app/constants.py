@@ -20,6 +20,10 @@ DT_MAX_KEYWORD_LENGTH = 100
 DT_MIN_THRESHOLD = 1
 DT_INSPECTION_TYPE_LENGTH = 20
 
+# Scan input bounds. A huge body is the realistic denial-of-service vector for
+# this service, so the limit is part of the security posture, not a formality.
+MAX_SCAN_TEXT_LENGTH = 1_000_000
+
 # Pagination bounds applied to every listing endpoint.
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200

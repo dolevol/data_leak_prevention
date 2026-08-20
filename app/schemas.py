@@ -11,6 +11,7 @@ Called by:
 """
 
 import uuid
+from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -19,6 +20,7 @@ from app.constants import (
     DT_MAX_KEYWORD_LENGTH,
     DT_MAX_KEYWORDS,
     MAX_NAME_LENGTH,
+    MAX_SCAN_TEXT_LENGTH,
     DT_MIN_THRESHOLD,
 )
 from app.models import DataSet, InspectionType
@@ -229,3 +231,71 @@ class DataSetRead(BaseModel):
             name=data_set.name,
             data_type_ids=[data_type.id for data_type in data_set.data_types],
         )
+
+
+class ScanStatus(str, Enum):
+    """Outcome of a scan, using the exact strings required by the specification."""
+
+    MATCH = "match"
+    NOT_MATCHED = "not matched"
+
+
+class Combine(str, Enum):
+    """How the per-Data-Type outcomes are combined into a single verdict.
+
+    It lives here, next to the other API enums, because it is a request field.
+    ``app.matchers`` imports it from this module, which keeps the dependency
+    one-way: the engine knows the contract, the contract knows no engine.
+    """
+
+    OR = "or"
+    AND = "and"
+
+
+class ScanRequest(BaseModel):
+    """Request body of ``POST /api/scan``.
+
+    Attributes:
+        text: The input to inspect.
+        data_set_id: The policy to evaluate the text against.
+        combine: How the Data Type outcomes form the verdict. Defaults to OR,
+            which is what the specification requires, so the field is optional
+            and existing clients are unaffected.
+    """
+
+    # The upper bound is the practical protection against a denial-of-service
+    # attempt; an empty text can never reach any threshold, so it is rejected too.
+    text: str = Field(min_length=1, max_length=MAX_SCAN_TEXT_LENGTH)
+    data_set_id: uuid.UUID
+    combine: Combine = Combine.OR
+
+
+class DetectedObject(BaseModel):
+    """A Data Type that reached its threshold during a scan.
+
+    Attributes:
+        id: Identifier of the Data Type that matched.
+        name: Its human-readable name, so the caller need not resolve the id.
+        match_count: Occurrences found - the same number the threshold was compared against.
+    """
+
+    id: uuid.UUID
+    name: str
+    match_count: int
+
+
+class ScanResult(BaseModel):
+    """Response body of ``POST /api/scan``.
+
+    ``detected_objects`` stays None when nothing matched, and the route is
+    declared with ``response_model_exclude_none`` so the field disappears from
+    the JSON entirely - which is exactly the ``{"status": "not matched"}``
+    payload the specification asks for.
+
+    Attributes:
+        status: Whether any Data Type matched.
+        detected_objects: The Data Types that matched, or None.
+    """
+
+    status: ScanStatus
+    detected_objects: list[DetectedObject] | None = None

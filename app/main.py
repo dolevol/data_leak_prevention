@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api import datasets, datatypes
+from app.api import datasets, datatypes, scan
 from app.crud import ConflictError, MissingDataTypesError
 from app.db import Base, engine
 
@@ -54,6 +54,7 @@ app = FastAPI(
 # as separate groups in the generated OpenAPI documentation at /docs.
 app.include_router(datatypes.router)
 app.include_router(datasets.router)
+app.include_router(scan.router)
 
 
 @app.exception_handler(ConflictError)

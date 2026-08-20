@@ -93,5 +93,27 @@ async def create_data_type(client: AsyncClient, **overrides) -> dict:
     return response.json()
 
 
+async def create_data_set(client: AsyncClient, *data_type_ids: str, name: str = "Policy") -> dict:
+    """Create a Data Set through the API and return the response body.
+
+    Lives here because three test modules need a Data Set as *setup*. Tests that
+    exercise creation itself still POST inline, so the assertion under test is
+    never hidden inside a helper.
+
+    Args:
+        client: The test HTTP client.
+        *data_type_ids: Identifiers of the members.
+        name: The Data Set name.
+
+    Returns:
+        dict: The created Data Set as returned by the API.
+    """
+    response = await client.post(
+        "/api/datasets", json={"name": name, "data_type_ids": list(data_type_ids)}
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
 UNKNOWN_ID = str(uuid.uuid4())
 """A syntactically valid UUID that is guaranteed not to exist in the database."""

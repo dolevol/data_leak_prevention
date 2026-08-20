@@ -146,6 +146,32 @@ flowchart LR
     D --> E["204 No Content<br/>the Data Types survive"]
 ```
 
+### 1.3 Scan
+
+**Scan** — `POST /api/scan`
+
+```mermaid
+flowchart LR
+    A["Client sends<br/>text, data_set_id"] --> B{"Schema valid?"}
+    B -- "no" --> B1["422<br/>empty text, over 1 MB,<br/>malformed UUID"]
+    B -- "yes" --> C["Load Data Set<br/>+ its Data Types in one query"]
+    C --> D{"Data Set exists?"}
+    D -- "no" --> D1["404"]
+    D -- "yes" --> E["For each Data Type:<br/>pick its engine, count occurrences"]
+    E --> F{"count >= threshold?"}
+    F -- "no" --> G["skip this Data Type"]
+    F -- "yes" --> H["add to detected_objects"]
+    G --> I{"combine mode"}
+    H --> I
+    I -- "OR (default)" --> J{"any detection?"}
+    I -- "AND" --> K{"did every<br/>Data Type fire?"}
+    K -- "no" --> L["discard all detections"]
+    K -- "yes" --> J
+    L --> J
+    J -- "no" --> J1["200<br/>{status: not matched}"]
+    J -- "yes" --> J2["200<br/>{status: match, detected_objects}"]
+```
+
 ---
 
 ## 2. Backend endpoints
@@ -169,8 +195,8 @@ flowchart LR
         DS4["PUT /{id}<br/>200 | 404 | 409"]
         DS5["DELETE /{id}<br/>204 | 404"]
     end
-    subgraph SC ["/api/scan — iteration 2"]
-        SC1["POST /<br/>200"]
+    subgraph SC ["/api/scan"]
+        SC1["POST /<br/>200 | 404 | 422"]
     end
 ```
 
@@ -205,12 +231,14 @@ flowchart TD
             subgraph L1 ["Presentation layer — HTTP boundary"]
                 direction LR
                 Main["app/main.py<br/>FastAPI app, lifespan,<br/>exception handlers"]
-                Routers["app/api/datatypes.py<br/>app/api/datasets.py<br/>APIRouter per module"]
+                Routers["app/api/datatypes.py<br/>app/api/datasets.py<br/>app/api/scan.py<br/>APIRouter per module"]
                 Schemas["app/schemas.py<br/>request validation,<br/>response shaping"]
             end
 
-            subgraph L2 ["Business layer — data access"]
+            subgraph L2 ["Business layer — data access and inspection logic"]
+                direction LR
                 Crud["app/crud.py<br/>every database query,<br/>no HTTP knowledge"]
+                Matchers["app/matchers.py<br/>counting functions,<br/>thresholds, OR/AND"]
             end
 
             subgraph L3 ["Persistence layer"]
@@ -229,32 +257,39 @@ flowchart TD
 
         Main --> Routers
         Routers --> Crud
+        Routers --> Matchers
         Crud --> Models
         Models --> Db
-
-        Deps -.->|"injected into"| Routers
-        Routers -.->|"validates with"| Schemas
-        Const -.-> Schemas
-        Const -.-> Models
-        Const -.-> Deps
-        Cfg -.-> Db
-        Db -.->|"yields session"| Deps
     end
 
     Db --> PG[("PostgreSQL 16<br/>docker-compose")]
 
+    %% Every solid request-path link is declared above, so the purple set below is
+    %% the contiguous range 0-6. Dashed links go after it: appending one can never
+    %% shift the styled indices again.
+    Deps -.->|"injected into"| Routers
+    Routers -.->|"validates with"| Schemas
+    Matchers -.->|"typed against"| Models
+    Const -.-> Schemas
+    Const -.-> Models
+    Const -.-> Deps
+    Cfg -.-> Db
+    Db -.->|"yields session"| Deps
+
     style Core fill:none,stroke:none
-    linkStyle 0,1,2,3,4,12 stroke:#7c3aed,stroke-width:3px
+    linkStyle 0,1,2,3,4,5,6 stroke:#7c3aed,stroke-width:3px
 ```
 
-The six solid arrows (`Client → Main → Routers → Crud → Models → Db → PG`) are styled purple and
-thicker on purpose: they are the **one** call path a request actually walks. Every dashed arrow
-is the Support layer being reached into sideways, not a step in that path.
+The purple arrows are the paths a request actually walks. A CRUD request follows the spine
+`Client → Main → Routers → Crud → Models → Db → PostgreSQL`; a scan request branches at the
+routers into `Matchers` instead, because the Data Types it inspects were already loaded by
+`crud`. Every dashed arrow is a dependency that is reached into sideways — the Support layer, the
+schemas, and the ORM classes `matchers` is merely typed against — not a step in any request path.
 
 | Layer | Modules | Role |
 |-------|---------|------|
 | Presentation | `main.py`, the routers, `schemas.py` | Owns the HTTP contract: routing, status codes, request/response shape |
-| Business | `crud.py` | Every query and every domain rule (conflicts, missing references) — no HTTP knowledge |
+| Business | `crud.py`, `matchers.py` | Every query and domain rule (conflicts, missing references), plus the whole inspection logic (counting, thresholds, OR/AND) — no HTTP knowledge |
 | Persistence | `models.py`, `db.py` | The ORM tables, constraints, engine and session factory |
 | Support | `deps.py`, `constants.py`, `config.py` | Cross-cutting: dependency injection, shared limits, environment settings — reached into by the other three, never called in sequence |
 
@@ -285,8 +320,8 @@ key, `FK` a foreign key and `UK` a unique key.
 
 ```mermaid
 erDiagram
-    DATA_TYPES ||--o{ DATASET_DATA_TYPES : "is referenced by"
-    DATA_SETS  ||--o{ DATASET_DATA_TYPES : "contains"
+    DATA_SETS  ||--o{ DATASET_DATA_TYPES : "has one row per member"
+    DATA_TYPES ||--o{ DATASET_DATA_TYPES : "has one row per membership"
 
     DATA_TYPES {
         uuid    id          PK "generated by the server"
@@ -307,6 +342,16 @@ erDiagram
         uuid data_type_id PK "FK -> data_types.id, ON DELETE RESTRICT"
     }
 ```
+
+Both relationship labels describe the **same** association table, read from its two ends - there
+is no second relationship hiding here. A row in `DATASET_DATA_TYPES` says "this Data Set includes
+this Data Type"; looking at it from the Data Set you call it a member, looking at it from the Data
+Type you call it a membership. The earlier wording ("contains" / "is referenced by") suggested two
+different things and was simply confusing.
+
+There is deliberately **no direct line** between `DATA_SETS` and `DATA_TYPES`. That is how a
+many-to-many relationship is drawn: it cannot exist as one foreign key, so it is decomposed into
+two one-to-many relationships that meet at the link table.
 
 Reading the crow's-foot notation: `||--o{` means "exactly one on the left, zero or more on the
 right". One Data Type may appear in zero, one or many association rows, and so may one Data Set —
@@ -404,7 +449,43 @@ classDiagram
         from_model(DataSet)
     }
     DataSetCreate <|-- DataSetUpdate
+
+    class ScanRequest {
+        +str text
+        +UUID data_set_id
+        +Combine combine = OR
+    }
+    class ScanResult {
+        +ScanStatus status
+        +list~DetectedObject~|None detected_objects
+    }
+    class DetectedObject {
+        +UUID id
+        +str name
+        +int match_count
+    }
+    class ScanStatus {
+        <<str, Enum>>
+        MATCH = "match"
+        NOT_MATCHED = "not matched"
+    }
+    class Combine {
+        <<str, Enum>>
+        OR = "or"
+        AND = "and"
+    }
+    ScanRequest --> Combine : selects
+    ScanResult --> ScanStatus : reports
+    ScanResult --> DetectedObject : lists
 ```
+
+The scan schemas break the `*Create` / `*Read` pattern on purpose: a scan creates nothing and
+reads no stored row, so its request and response are named after the operation instead of a
+resource. Two details carry real behaviour. `detected_objects` is nullable and the route is
+declared with `response_model_exclude_none`, which is what makes a miss serialize as exactly
+`{"status": "not matched"}` rather than carrying an empty array. And `combine` defaults to `OR`,
+so the field is optional and a client that never heard of it behaves exactly as the specification
+requires.
 
 Note the asymmetry. `DataTypeRead` inherits from the base and is built straight from the ORM
 object via `from_attributes`, because the stored shape and the wire shape are identical.
@@ -414,6 +495,92 @@ requires `data_type_ids` (a flat array), so `from_model` performs that translati
 Two module-level helpers are shared by all validators: `_require_text` trims a mandatory string
 and rejects a blank one, `_optional_text` trims an optional string and collapses a blank one to
 `None`. `_dedupe` removes repeats while preserving order.
+
+### 5.3 `app/matchers.py`
+
+The whole inspection logic is one module of plain functions. It separates **mechanics** (how many
+times did a rule fire) from **policy** (is that enough, and how do the rules combine) - with a
+function per logic and a dispatch dict, and no classes at all.
+
+```mermaid
+classDiagram
+    class counting_functions {
+        <<module level>>
+        _count_keywords(patterns, text) int
+        _count_substrings(...) : future
+        _count_regex(...) : future
+        _count_llm(...) : future
+    }
+    class _COUNTERS {
+        <<dict>>
+        InspectionType.KEYWORDS : _count_keywords
+    }
+    class policy_functions {
+        <<module level>>
+        detect(data_types, text, combine) list~DetectedObject~
+        _detect_one(data_type, text) DetectedObject|None
+        _count(data_type, text) int
+    }
+    class Combine {
+        <<str, Enum>>
+        OR = "or"
+        AND = "and"
+    }
+    policy_functions --> _COUNTERS : looks up by data_type.type
+    _COUNTERS --> counting_functions : holds
+    policy_functions --> Combine : takes as an argument
+```
+
+Adding an inspection logic is two lines: a function with the signature
+`(patterns: list[str], text: str) -> int`, and one entry in `_COUNTERS`. There is no protocol to
+implement, no base class to inherit, no class to instantiate and no file to create.
+
+Why the counting functions return a **number** and not a boolean: the threshold comparison is
+policy and belongs to `detect`, and the number is needed anyway - it is reported back as
+`match_count`.
+
+Why `combine` is an argument of `detect` rather than state on an object: the module holds no state
+at all, so there is nothing an object would carry. Passing it per call keeps OR/AND an open
+argument all the way up to the API request. An empty result always means "not matched", in either
+mode, so no caller has to know which mode was used.
+
+### Whole-word counting without regex
+
+The counting rule is expressed with plain string comparison rather than a compiled pattern:
+
+1. Both the text and the keyword are lower-cased once - that is the entire case-insensitivity rule.
+2. `str.find` walks the text, returning each occurrence left to right.
+3. Each occurrence is kept only if `_is_standalone` accepts it: the characters immediately before
+   and after must not be letters or digits (`str.isalnum()`).
+
+This is shorter to read than an escaped alternation, and it removes three classes of problem
+outright rather than defending against them:
+
+| Case | Why plain comparison handles it |
+|------|-------------------------------|
+| `a.b` must not match `axb` | `str.find` is literal; there are no metacharacters to escape |
+| `c++` must match standalone but not inside `c++11` | The character after the hit is a digit, which extends the token |
+| user-supplied keywords as a ReDoS vector | No pattern is ever compiled from user input |
+| `pass` must not match `password` | The neighbouring character is a letter, so the token continues |
+
+The underscore is deliberately **not** a word character here, which is the one place this rule
+departs from a regex `\b`. For a DLP service snake_case is a separator, not glue: `ssn_number`,
+`passport_id` and `credit_card_number` are precisely the field names sensitive data travels
+under, and missing `ssn` inside `ssn_number` would be a detection failure. A letter is a
+different case entirely - `password` is its own word, not `pass` with a separator attached.
+
+One deliberate semantic difference from an alternation pattern: **each keyword is counted
+independently**. Keywords that overlap on the same span - `credit` and `credit card` over
+"my credit card" - contribute one occurrence each, where a single alternation would have counted
+one. A keyword that is merely a prefix of a longer one is still never double counted, because the
+boundary check rejects it.
+
+There is no cache. Nothing is precomputed, so there is nothing to invalidate and no stale rule can
+ever be served.
+
+Counting is **synchronous**. Keyword matching is pure CPU work and a pointless `await` is noise.
+An LLM engine would be IO-bound; at that point the counting functions become `async def` and
+`_count` gains an `await` - one line per engine, decided deliberately rather than pre-emptively.
 
 ---
 
@@ -471,8 +638,10 @@ The project is designed so that adding inspection types requires no rewrite:
   or `llm` means adding a member.
 - `crud.py` contains no matching logic at all, so the engine can be replaced without touching a
   single query.
-- Iteration 2 adds a matcher registry (`InspectionType -> Matcher` behind a shared protocol)
-  instead of an `if type == ...` chain. A scan selects the engine by the Data Type's type.
+- The `_COUNTERS` dict in `app/matchers.py` maps `InspectionType -> counting function`. Adding an
+  engine is: one enum member, one function, one dict entry. No caller changes. Concretely, a regex
+  engine would read the same `content` column and reuse the same threshold and combine logic; an
+  LLM engine would additionally need the configuration column described below.
 - The `type` column is stored as VARCHAR with a CHECK constraint (`native_enum=False`) rather
   than a native PostgreSQL ENUM, so adding a value is a constraint change and not an `ALTER TYPE`.
 - An LLM-based engine would additionally need a configuration column (for example `config JSONB`)

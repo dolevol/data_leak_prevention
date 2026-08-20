@@ -10,8 +10,8 @@ in three iterations:
 | Iteration | Scope | Status |
 |-----------|-------|--------|
 | 1 | Data Type and Data Set management, database, validation, tests, documentation | ✅ done |
-| 2 | The `/api/scan` endpoint and the matching engine | ⏳ next |
-| 3 | Optimisation, concurrency, full Docker setup, functional extensions | ⏳ pending |
+| 2 | The `/api/scan` endpoint and the matching engine | ✅ done |
+| 3 | Optimisation, concurrency, full Docker setup, functional extensions | ⏳ next |
 
 ---
 
@@ -76,6 +76,7 @@ decides the identity.
 | GET | `/api/datasets/{id}` | Read one | 200 |
 | PUT | `/api/datasets/{id}` | Full replacement | 200 |
 | DELETE | `/api/datasets/{id}` | Delete | 204 |
+| POST | `/api/scan` | Scan a text against a Data Set | 200 |
 
 End-to-end example:
 
@@ -91,9 +92,48 @@ curl -X POST http://127.0.0.1:8000/api/datasets \
   -H 'Content-Type: application/json' \
   -d '{"name":"HR Policy","data_type_ids":["<DT_UUID>"]}'
 
+# Scan a text against the Data Set
+curl -X POST http://127.0.0.1:8000/api/scan \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"my ssn, my passport and my visa","data_set_id":"<DS_UUID>"}'
+# -> {"status":"match","detected_objects":[{"id":"...","name":"...","match_count":3}]}
+
+# Require every Data Type of the set to fire, instead of any one of them
+curl -X POST http://127.0.0.1:8000/api/scan \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"...","data_set_id":"<DS_UUID>","combine":"and"}'
+
 # Deleting the Data Type while it is in use is refused with 409
 curl -i -X DELETE http://127.0.0.1:8000/api/datatypes/<DT_UUID>
 ```
+
+## Scanning semantics
+
+`POST /api/scan` takes a text and a Data Set id and answers immediately — the caller never
+receives a job id to poll.
+
+- Every Data Type in the Data Set is evaluated **independently**; counts are never pooled.
+- A Data Type matches when its **occurrence count reaches its threshold**. Repetitions count, so
+  the same keyword found three times is a count of three (see `docs/QA.md` Q3).
+- Keywords match **whole words only**: the keyword `pass` is not found in `password`, `bypass` or
+  `my_pass`, but is found in `(pass)` and `Pass,`.
+- Matching is **case-insensitive** — an engine that misses `PASSWORD` would be worthless.
+- Data Types combine with **OR** by default: the scan matches when at least one of them did, and
+  every Data Type that matched is listed in `detected_objects`.
+- The combination is an open argument. Sending `"combine": "and"` requires *every* Data Type in
+  the Data Set to reach its threshold; a partial hit is reported as not matched. The field is
+  optional and defaults to `"or"`, so the behaviour required by the specification is the default.
+
+```json
+{"status": "match",
+ "detected_objects": [{"id": "dt-uuid", "name": "Sensitive Keywords", "match_count": 3}]}
+```
+
+```json
+{"status": "not matched"}
+```
+
+The response carries no `detected_objects` key at all when nothing matched.
 
 ## Validation
 
@@ -108,6 +148,8 @@ column sizes and CHECK constraints — so the API layer and the database can nev
   to 100 characters, and duplicates are dropped while the order is preserved.
 - `threshold` — integer greater than or equal to 1 (a threshold of 0 would flag every text).
 - `data_type_ids` — non-empty list of UUIDs; duplicates are dropped and an unknown id yields 404.
+- `text` — non-empty and at most 1,000,000 characters. The upper bound is real protection: an
+  unbounded body is the denial-of-service vector for a scanning service.
 - `limit` / `offset` — `1 ≤ limit ≤ 200` and `offset ≥ 0`.
 
 Validation is deliberately duplicated across two layers. Pydantic protects the API and produces
@@ -128,10 +170,12 @@ app/
 ├── models.py       # SQLAlchemy models: DataType, DataSet, association table
 ├── schemas.py      # Pydantic schemas and every validation rule
 ├── crud.py         # internal layer: all queries, no HTTP knowledge
+├── matchers.py     # inspection logic: counting functions, thresholds, OR/AND
 └── api/
     ├── deps.py         # shared dependencies (session, pagination bounds)
     ├── datatypes.py    # router for /api/datatypes
-    └── datasets.py     # router for /api/datasets
+    ├── datasets.py     # router for /api/datasets
+    └── scan.py         # router for /api/scan
 tests/              # pytest suite running against a real database
 docs/               # ARCHITECTURE.md and QA.md
 ```

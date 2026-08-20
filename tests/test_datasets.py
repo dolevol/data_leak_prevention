@@ -4,7 +4,7 @@ between Data Sets and Data Types.
 
 from httpx import AsyncClient
 
-from tests.conftest import UNKNOWN_ID, create_data_type
+from tests.conftest import UNKNOWN_ID, create_data_set, create_data_type
 
 
 async def test_create_links_existing_data_types(client: AsyncClient) -> None:
@@ -62,11 +62,7 @@ async def test_update_replaces_membership(client: AsyncClient) -> None:
     """PUT swaps the whole membership list rather than appending to it."""
     first = await create_data_type(client, name="First")
     second = await create_data_type(client, name="Second")
-    created = (
-        await client.post(
-            "/api/datasets", json={"name": "HR Policy", "data_type_ids": [first["id"]]}
-        )
-    ).json()
+    created = await create_data_set(client, first["id"], name="HR Policy")
 
     response = await client.put(
         f"/api/datasets/{created['id']}",
@@ -79,11 +75,7 @@ async def test_update_replaces_membership(client: AsyncClient) -> None:
 async def test_get_and_list_return_the_data_set(client: AsyncClient) -> None:
     """A Data Set is readable individually and through the listing."""
     data_type = await create_data_type(client)
-    created = (
-        await client.post(
-            "/api/datasets", json={"name": "HR Policy", "data_type_ids": [data_type["id"]]}
-        )
-    ).json()
+    created = await create_data_set(client, data_type["id"], name="HR Policy")
 
     assert (await client.get(f"/api/datasets/{created['id']}")).json() == created
     assert (await client.get("/api/datasets")).json() == [created]
@@ -97,9 +89,7 @@ async def test_get_unknown_id_returns_404(client: AsyncClient) -> None:
 async def test_delete_data_type_in_use_returns_409(client: AsyncClient) -> None:
     """The ON DELETE RESTRICT constraint protects a Data Type that is in use."""
     data_type = await create_data_type(client)
-    await client.post(
-        "/api/datasets", json={"name": "HR Policy", "data_type_ids": [data_type["id"]]}
-    )
+    await create_data_set(client, data_type["id"], name="HR Policy")
 
     response = await client.delete(f"/api/datatypes/{data_type['id']}")
     assert response.status_code == 409
@@ -109,11 +99,7 @@ async def test_delete_data_type_in_use_returns_409(client: AsyncClient) -> None:
 async def test_delete_data_type_succeeds_after_data_set_removed(client: AsyncClient) -> None:
     """Once the referencing Data Set is gone, the Data Type can be deleted."""
     data_type = await create_data_type(client)
-    data_set = (
-        await client.post(
-            "/api/datasets", json={"name": "HR Policy", "data_type_ids": [data_type["id"]]}
-        )
-    ).json()
+    data_set = await create_data_set(client, data_type["id"], name="HR Policy")
 
     assert (await client.delete(f"/api/datasets/{data_set['id']}")).status_code == 204
     assert (await client.delete(f"/api/datatypes/{data_type['id']}")).status_code == 204
@@ -122,11 +108,7 @@ async def test_delete_data_type_succeeds_after_data_set_removed(client: AsyncCli
 async def test_delete_data_set_keeps_its_data_types(client: AsyncClient) -> None:
     """Deleting a Data Set removes only the memberships, never the Data Types."""
     data_type = await create_data_type(client)
-    data_set = (
-        await client.post(
-            "/api/datasets", json={"name": "HR Policy", "data_type_ids": [data_type["id"]]}
-        )
-    ).json()
+    data_set = await create_data_set(client, data_type["id"], name="HR Policy")
 
     await client.delete(f"/api/datasets/{data_set['id']}")
     assert (await client.get(f"/api/datatypes/{data_type['id']}")).status_code == 200
