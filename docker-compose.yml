@@ -1,0 +1,24 @@
+# Development infrastructure: the database only.
+# The API service itself is added in iteration 3, together with its Dockerfile.
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: dlp_postgres
+    environment:
+      POSTGRES_USER: dlp
+      POSTGRES_PASSWORD: dlp
+      POSTGRES_DB: dlp
+    ports:
+      - "5432:5432"
+    volumes:
+      - dlp_pgdata:/var/lib/postgresql/data
+      # Runs once, when the volume is initialized, to prepare the test database.
+      - ./scripts/init_test_db.sql:/docker-entrypoint-initdb.d/init_test_db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dlp -d dlp"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  dlp_pgdata:
