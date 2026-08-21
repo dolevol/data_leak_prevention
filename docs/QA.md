@@ -1012,3 +1012,590 @@ FastAPI), ואף endpoint לא צריך `try/except` משלו סביב קריא�
 **הבחנה חשובה:** הוא הוחלף רק היכן שיצירת ה-Data Set היא *setup*. בטסטים שבודקים את היצירה
 עצמה (409, 422, 404, הסרת כפילויות) ה-POST נשאר inline — עוזר שמכיל `assert 201` היה מסתיר
 בדיוק את הקביעה הנבדקת.
+
+---
+
+## סבב 11 – מסע מלא של בקשה אחת: `GET /api/datasets/{id}` (2026-08-20)
+
+סעיף זה עוקב אחרי בקשה אחת מקצה לקצה. כל השאילתות והנתונים כאן **הועתקו מריצה אמיתית** עם
+`DB_ECHO=true`, ולא נכתבו מהזיכרון.
+
+### שלב 0 – מה באמת יושב במסד הנתונים
+
+קודם כל חשוב לראות את נקודת המוצא. שלוש טבלאות, וכל אחת מחזיקה חתיכה אחרת מהתמונה:
+
+טבלת `data_types` — הכללים עצמם:
+
+```
+                  id                  |       name        | threshold |    content
+--------------------------------------+-------------------+-----------+----------------
+ 1b311d51-9725-410c-beb0-6e95a9d103f0 | Identifiers 24674 |         2 | {ssn,passport}
+ 464e912d-c0bb-430d-b7b0-7c0f6dfff1bb | Salary 24674      |         1 | {salary}
+```
+
+טבלת `data_sets` — רק שם ומזהה. שים לב שאין בה **שום** אזכור של ה-Data Types:
+
+```
+                  id                  |      name
+--------------------------------------+-----------------
+ 6003c9bb-663a-4bce-96c6-a0734f89bd72 | HR Policy 24674
+```
+
+טבלת `dataset_data_types` — כאן נשמר החיבור, שורה לכל שיוך:
+
+```
+              dataset_id              |             data_type_id
+--------------------------------------+--------------------------------------
+ 6003c9bb-663a-4bce-96c6-a0734f89bd72 | 1b311d51-9725-410c-beb0-6e95a9d103f0
+ 6003c9bb-663a-4bce-96c6-a0734f89bd72 | 464e912d-c0bb-430d-b7b0-7c0f6dfff1bb
+```
+
+הנה הרעיון בבירור: המידע **מפוזר על פני שלוש טבלאות**, ואף אחת מהן לבדה אינה יודעת מה התשובה
+המלאה. זו בדיוק העבודה שהבקשה צריכה לעשות — לאסוף אותן חזרה לתמונה אחת.
+
+### שלב 1 – הבקשה מגיעה, ו-FastAPI מפרק את הנתיב
+
+הלקוח שולח:
+
+```
+GET /api/datasets/6003c9bb-663a-4bce-96c6-a0734f89bd72
+```
+
+לפני ששורת קוד אחת שלנו רצה, FastAPI עושה שני דברים:
+
+ראשית הוא מנתב, ומזהה שהנתיב תואם ל-`@router.get("/{data_set_id}")` שב-`app/api/datasets.py`.
+שנית הוא רואה את רמז הטיפוס `data_set_id: uuid.UUID`, ומנסה להמיר את המחרוזת מהכתובת לאובייקט
+UUID. אילו היה נשלח `not-a-uuid`, הבקשה הייתה נעצרת כאן ב-422, והפונקציה שלנו לא הייתה מופעלת
+כלל.
+
+במקביל FastAPI פותר את התלות `SessionDep`, מריץ את `get_session` עד ה-`yield`, ומכניס
+`AsyncSession` חי לארגומנטים. רק עכשיו הפונקציה שלנו נקראת.
+
+### שלב 2 – שאילתה ראשונה: מביאים את ה-Data Set עצמו
+
+הפונקציה קוראת ל-`crud.get_data_set`, שמריצה `session.get(DataSet, data_set_id)`. זהו ה-SQL
+האמיתי שנשלח:
+
+```sql
+BEGIN (implicit)
+
+SELECT data_sets.id AS data_sets_id, data_sets.name AS data_sets_name
+FROM data_sets
+WHERE data_sets.id = $1::UUID
+-- פרמטר: UUID('6003c9bb-663a-4bce-96c6-a0734f89bd72')
+```
+
+מה שחוזר הוא שורה אחת: `(6003c9bb..., 'HR Policy 24674')`. שים לב למה שחסר — אין כאן שום
+`data_type_ids`. בשלב הזה, אובייקט ה-Python שנבנה בזיכרון נראה כך:
+
+```python
+DataSet(id=UUID('6003c9bb-...'), name='HR Policy 24674', data_types=<עוד לא נטען>)
+```
+
+הסימן `$1::UUID` הוא **פרמטר מאוגד** (bound parameter). הערך אינו מודבק לתוך מחרוזת ה-SQL אלא
+נשלח בנפרד — וזו הסיבה שהקוד הזה חסין ל-SQL injection מעצם הבנייה שלו.
+
+### שלב 3 – שאילתה שנייה: מי החברים בקבוצה
+
+מיד לאחר מכן נשלחת שאילתה שנייה, שאיש לא כתב במפורש. היא נוצרת בגלל
+`lazy="selectin"` שהוגדר על הקשר ב-`app/models.py`:
+
+```sql
+SELECT data_sets_1.id            AS data_sets_1_id,
+       data_types.id             AS data_types_id,
+       data_types.name           AS data_types_name,
+       data_types.description    AS data_types_description,
+       data_types.type           AS data_types_type,
+       data_types.content        AS data_types_content,
+       data_types.threshold      AS data_types_threshold
+FROM data_sets AS data_sets_1
+JOIN dataset_data_types AS dataset_data_types_1
+     ON data_sets_1.id = dataset_data_types_1.dataset_id
+JOIN data_types
+     ON data_types.id = dataset_data_types_1.data_type_id
+WHERE data_sets_1.id IN ($1::UUID)
+ORDER BY data_types.name
+```
+
+זו השאילתה שעושה את העבודה האמיתית, וכדאי לקרוא אותה לאט. היא מבצעת **שני JOIN רצופים**, וזו
+הדרך היחידה לחצות קשר many-to-many:
+
+```
+   data_sets              dataset_data_types              data_types
+   ┌──────────┐           ┌───────────┬─────────────┐     ┌──────────┐
+   │ id       │◄──JOIN 1──│ dataset_id│ data_type_id│──JOIN 2──►│ id  │
+   │ name     │           └───────────┴─────────────┘     │ name ... │
+   └──────────┘                                            └──────────┘
+      "מי אני"              "מי מחובר למי"                  "מה הכלל"
+```
+
+ה-JOIN הראשון עונה על "אילו שורות שיוך שייכות ל-Data Set הזה" ומחזיר שתי שורות. ה-JOIN השני
+לוקח כל אחת מהן ומביא את ה-Data Type המלא שמאחורי המזהה. התוצאה הגולמית משתי השאילתות היחד:
+
+```
+ data_sets_1_id | data_types_id | data_types_name   | threshold | content
+----------------+---------------+-------------------+-----------+----------------
+ 6003c9bb-...   | 1b311d51-...  | Identifiers 24674 |         2 | {ssn,passport}
+ 6003c9bb-...   | 464e912d-...  | Salary 24674      |         1 | {salary}
+```
+
+שלוש נקודות שקל לפספס בשאילתה הזו:
+
+- הביטוי `IN ($1::UUID)` נראה מיותר עבור Data Set יחיד, אבל הוא הסיבה ש-`selectin` פותר את
+  בעיית ה-N+1: בשליפת רשימה של 50 Data Sets, ה-`IN` היה מכיל 50 מזהים ומסתפק ב**שאילתה אחת
+  נוספת בסך הכל**, במקום 50 שאילתות נפרדות.
+- הביטוי `ORDER BY data_types.name` אינו מקרי — הוא מגיע מ-`order_by=DataType.name` שהוגדר על
+  הקשר, והוא מבטיח שסדר המזהים בתשובה יהיה יציב בין קריאה לקריאה.
+- השאילתה מביאה את **כל** עמודות ה-Data Type, כולל `content` ו-`threshold`, למרות שהתשובה
+  תכיל רק מזהים. זה נראה בזבזני, אבל זהו אותו קוד טעינה שמשרת את הסריקה — ושם דווקא נחוצים כל
+  השדות.
+
+אחרי השאילתה הזו האובייקט בזיכרון הושלם:
+
+```python
+DataSet(
+    id=UUID('6003c9bb-...'),
+    name='HR Policy 24674',
+    data_types=[
+        DataType(id=UUID('1b311d51-...'), name='Identifiers 24674',
+                 content=['ssn', 'passport'], threshold=2, ...),
+        DataType(id=UUID('464e912d-...'), name='Salary 24674',
+                 content=['salary'], threshold=1, ...),
+    ],
+)
+```
+
+### שלב 4 – התרגום לחוזה ה-API
+
+עכשיו נכנס `DataSetRead.from_model`, ותפקידו הופך למוחשי. ה-ORM מחזיק **רשימת אובייקטים**
+בשדה ששמו `data_types`, בעוד המסמך דורש **מערך שטוח של מזהים** בשדה ששמו `data_type_ids`:
+
+```python
+return cls(
+    id=data_set.id,
+    name=data_set.name,
+    data_type_ids=[data_type.id for data_type in data_set.data_types],
+)
+```
+
+זו בדיוק הסיבה ש-`from_attributes` אינו יכול לעבוד כאן: הוא מחפש תכונה בשם `data_type_ids`,
+ולאובייקט ה-ORM אין תכונה כזו כלל. ההבדל הוא בשמות, לא בגחמה.
+
+### שלב 5 – סריאליזציה ותשובה
+
+Pydantic ממיר את האובייקטים לטיפוסי JSON — כל `uuid.UUID` הופך למחרוזת — ו-`response_model`
+מסנן כל שדה שאינו מוצהר בסכימה. התוצאה הסופית שהלקוח מקבל:
+
+```json
+{
+    "id": "6003c9bb-663a-4bce-96c6-a0734f89bd72",
+    "name": "HR Policy 24674",
+    "data_type_ids": [
+        "1b311d51-9725-410c-beb0-6e95a9d103f0",
+        "464e912d-c0bb-430d-b7b0-7c0f6dfff1bb"
+    ]
+}
+```
+
+ולבסוף, אחרי שהתשובה נבנתה, ה-session נסגר. בלוג מופיע:
+
+```sql
+ROLLBACK
+```
+
+זה **אינו** סימן לכשל. הבקשה לא כתבה דבר ולכן לא קראה ל-`commit`, וסגירת session פתוח מסיימת
+את הטרנזקציה ב-`ROLLBACK`. עבור קריאה בלבד זו הצורה הזולה והנכונה לשחרר את החיבור חזרה לבריכה.
+
+### סיכום: שתי שאילתות, לא אחת ולא שלוש
+
+| # | השאילתה | מה היא עונה |
+|---|---------|-------------|
+| 1 | `SELECT ... FROM data_sets WHERE id = ...` | "האם ה-Data Set הזה קיים, ומה שמו?" |
+| 2 | `SELECT ... JOIN dataset_data_types JOIN data_types ...` | "אילו Data Types חברים בו?" |
+
+**מדוע לא אחת?** אפשר היה לאחד ל-JOIN יחיד, אבל אז שם ה-Data Set היה חוזר משוכפל בכל שורה
+(פעם לכל חבר) — מה שנקרא "מכפלה קרטזית" — ובקבוצה עם 100 חברים היינו שולחים את אותו שם 100
+פעמים ברשת. `selectin` מפצל בכוונה כדי להימנע מכך.
+
+**מדוע לא שלוש?** מפני שטבלת הקישור לעולם אינה נשלפת בפני עצמה. היא רק **גשר** בתוך ה-JOIN,
+וזו הסיבה שאין לה מודל ORM משלה ב-`app/models.py` אלא רק `Table`.
+
+---
+
+## סבב 6 – היכרות עם Docker לפני יצירת Dockerfile לשירות (2026-08-20)
+
+### ש17. הסבר בהרחבה את חמשת הקונספטים (image/container, מבנה Dockerfile, layer caching, networking ב-compose, volumes) ופרט על מה שכבר כתוב ב-docker-compose.yml
+
+תשובה, חלק 1 — הקונספטים:
+
+**Image מול Container.** Image הוא ערימת שכבות read-only, כל שורה ב-Dockerfile מוסיפה שכבה
+חדשה מעליה — הוא immutable, לא ניתן לשנות אותו אחרי הבנייה, רק לבנות image חדש. Container
+הוא מופע רץ של image, עם שכבת כתיבה דקה נוספת (thin writable layer); כל מה שקורה בזמן ריצה
+נכתב לשכבה הזו בלבד. אנלוגיה: image כמו class בפייתון, container כמו instance שלו. דוגמה
+מהפרויקט: `postgres:16-alpine` הוא image, `dlp_postgres` הוא ה-container הרץ שלו. מחיקת
+container לא מוחקת את ה-image שממנו הוא נוצר.
+
+**מבנה Dockerfile:**
+
+| פקודה | תפקיד |
+|-------|-------|
+| `FROM <image>` | הבסיס לבנייה, שורה ראשונה, קובע גם מערכת הפעלה וגם מה מותקן |
+| `WORKDIR /app` | תיקיית עבודה בתוך ה-container; כל פקודה יחסית שלאחריה מתייחסת אליה |
+| `COPY <src> <dst>` | מעתיק קבצים מ-build context לתוך שכבת ה-image (עותק אמיתי, לא mount) |
+| `RUN <command>` | מריץ פקודת shell בזמן בנייה, התוצאה נשמרת כשכבה חדשה |
+| `CMD [...]` | הפקודה שרצה כשמפעילים container מה-image; ניתנת לדריסה בקלות |
+| `EXPOSE <port>` | תיעוד בלבד — הפתיחה האמיתית כלפי חוץ נעשית ב-`ports:` |
+
+**Layer caching.** כל שורה יוצרת שכבה עם cache לפי hash של הפקודה והקבצים. ברגע ששכבה
+משתנה, כל השכבות אחריה נבנות מחדש — לכן הטריק: להעתיק ולהתקין תלויות (`COPY
+requirements.txt` + `RUN pip install`) **לפני** העתקת קוד המקור, כי הקוד משתנה כמעט בכל
+commit בעוד requirements.txt משתנה לעיתים רחוקות.
+
+**Networking בתוך compose.** `docker compose up` יוצר רשת bridge וירטואלית ייעודית, עם DNS
+פנימי שמאפשר לכל container "לראות" containers אחרים לפי שם השירות (למשל `db`) ולא IP קבוע.
+לכן בתוך container של האפליקציה, `DATABASE_URL` יצטרך להיות `...@db:5432/...` ולא
+`@localhost:5432`. `ports:` חושף פורט כלפי חוץ למארח; בין containers באותה רשת compose,
+הגישה עובדת גם בלעדיו, רק לפי שם השירות.
+
+**Volumes.** container הוא stateless בברירת מחדל — שכבת הכתיבה נמחקת כליל כש-container
+מוסר. Volume מאחסן נתונים מחוץ למחזור החיים של ה-container, מנוהל על ידי Docker (בשונה
+מ-bind mount שמצביע לנתיב ספציפי במארח). נשמר גם אחרי `docker compose down` (בלי `-v`).
+
+תשובה, חלק 2 — פירוט docker-compose.yml הקיים, שורה-שורה:
+
+- `services:` — המפתח העליון שמכיל את רשימת ה-containers שComposeמנהל יחד.
+- `db:` — שם השירות, וגם שם ה-host שלפיו שירותים אחרים באותה רשת יגיעו אליו.
+- `image: postgres:16-alpine` — image מוכן מ-Docker Hub, בלי Dockerfile מקומי. `alpine` =
+  בסיס Linux מינימלי, image קטן ומהיר יותר, במחיר `musl` במקום `glibc`.
+- `container_name: dlp_postgres` — שם קבוע ל-container במקום שם אוטומטי שComposeמייצר.
+- `environment:` — משתני סביבה שהimage הרשמי של Postgres קורא **רק בהפעלה הראשונה** (תיקיית
+  נתונים ריקה) ליצירת המשתמש/סיסמה/DB הראשוניים.
+- `ports: - "5432:5432"` — פורמט `"HOST:CONTAINER"`, ממפה פורט 5432 מארח לפורט 5432
+  container, לגישה מכלים שרצים ישירות על המארח.
+- `volumes:` שורה 1 (`dlp_pgdata:/var/lib/postgresql/data`) — named volume על תיקיית
+  הנתונים האמיתית — נתונים שורדים מחיקת container.
+- `volumes:` שורה 2 (`./scripts/init_test_db.sql:...:ro`) — bind mount read-only; ה-image
+  הרשמי מריץ אוטומטית כל קובץ תחת `/docker-entrypoint-initdb.d/` פעם אחת בלבד באתחול ראשוני
+  — כך נוצר `dlp_test` בלי צעד ידני.
+- `healthcheck:` — Docker מריץ את `pg_isready` בתדירות קבועה כדי לדעת מתי Postgres "בריא".
+  קריטי כש-`api` יתווסף עם `depends_on: db: condition: service_healthy`.
+- `volumes: dlp_pgdata:` בתחתית — הצהרה על ה-named volume; הגדרה ריקה = Docker מנהל את
+  מיקום האחסון בעצמו.
+
+---
+
+## סבב 12 – מעבר מ-`selectin` ל-`joined` (2026-08-21)
+
+**ש40. מה בעייתי ב-`joinedload` עבור רשימה, והאם תת-שאילתה פותרת זאת?**
+יש כאן **שתי בעיות נפרדות** שקל לבלבל ביניהן.
+
+הראשונה היא `LIMIT`. אחרי JOIN, `LIMIT` סופר **שורות מצורפות** ולא הורים — בקשה ל-3 קבוצות עם
+5 חברים כל אחת מחזירה 3 שורות ששייכות כולן לקבוצה **אחת**, ועוד חתוכה. זו אחת התקלות הנפוצות
+ביותר בדפדוף מול ORM. **תת-שאילתה אכן פותרת אותה**, וזה בדיוק מה ש-SQLAlchemy עושה: הוא עוטף את
+שאילתת האב ב-`(SELECT ... LIMIT ...) AS anon_1` ומצרף אליה. הכל בהלוך-חזור אחד.
+
+השנייה היא שכפול נתוני האב, ו**תת-שאילתה אינה פותרת אותה כלל**. `SELECT` מחזיר מלבן, ולכן שורת
+אב אחת מול חמישה חברים חייבת לחזור חמש פעמים. `selectin` אינו מפצל לשתי שאילתות כדי לגלות
+מזהים — הוא מפצל כדי שנתוני האב יעברו פעם אחת.
+
+קיימת אפשרות שלישית שמשיגה את שתיהן: `json_agg` של פוסטגרס מחזיר שורה אחת לכל קבוצה עם החברים
+במערך. נדחתה — היא תחבירית לפוסטגרס, עוקפת את מיפוי ה-ORM, ופותרת בעיה ששווה כאן 6%.
+
+**ש41. ההחלטה: מעבר ל-`lazy="joined"`.**
+נמדד, ו-`joined` מהיר יותר **בכל** התרחישים בסכימה הזו:
+
+| תרחיש | `selectin` | `joined` |
+|-------|-----------|----------|
+| קבוצה בודדת, 5 חברים | 1.46 ms | **0.81 ms** |
+| רשימה של 30 | 4.24 ms | **1.98 ms** |
+| רשימה של 200 × 20 חברים | 86.48 ms | **53.00 ms** |
+
+הסיבה היא **צורת השורות**, לא כמותן: שורת `data_sets` היא `id` + `name`, כ-29 בייט, בעוד שורת
+`data_types` נושאת את מערך המילים. ב-200 קבוצות × 20 חברים, שכפול האב עולה 116KB מול 1.99MB של
+ילדים — 6% — וחוסך הלוך-חזור שלם. הכיוון מתהפך כשהאב הוא הצד הרחב: בסימולציה עם אב של 2KB,
+`joined` לקח 20.7ms מול 12.7ms ל-`selectin`.
+
+**מה השתנה בקוד:** `lazy="selectin"` → `lazy="joined"` ב-`app/models.py`, ותוספת
+`result.unique()` ב-`list_data_sets` שב-`app/crud.py` — חובה, כי ה-JOIN מחזיר שורה לכל חבר
+ו-SQLAlchemy זורק שגיאה במקום לנחש. כל 63 הטסטים עברו ללא שינוי, וזו אמת המידה שההתנהגות זהה.
+
+**הערה על ההנמקה הקודמת:** בסבבים 11 ו-12 טענתי ש-`selectin` עדיף לרשימות. הטענה לא נמדדה
+והתבררה כשגויה בסכימה הזו. הכלל הנכון: **האב צר והילדים רחבים → `joined`; האב רחב או fan-out
+עצום → `selectin`.**
+
+
+## הסבר GEMINI מעולה
+
+הסיטואציה שתיארת היא קלאסית: קלוד הציע בהתחלה selectin כי זה כלל האצבע (Best Practice) הדיפולטיבי של SQLAlchemy לשליפת קולקציות (כמו Many-to-Many). אבל, כפי שכל מהנדס תוכנה מנוסה יגיד לך - כללי אצבע נועדו כדי שיבדקו אותם במציאות. כשהמציאות (המדידות) הראתה אחרת, קלוד שינה את דעתו ל-joined.
+
+בוא נפרק את הטקסט המרתק הזה טענה אחרי טענה, ונבין בדיוק למה joined מנצח במקרה הספציפי שלך.
+
+1. חובת הטעינה המוקדמת (Eager Loading)
+"Some form of eager loading is not optional in this service: touching a lazily-loaded collection would emit IO from an already-returned async context and raise MissingGreenlet."
+
+ההסבר הפשוט:
+בסביבה אסינכרונית (Async), אי אפשר לשלוף את ה-Datasets, לסגור את הקונטקסט מול ה-DB, ואז בתוך הלולאה בקוד לעשות dataset.data_types. גישה כזו (שנקראת Lazy Loading) תנסה לפתוח פתאום בקשת רשת חדשה (IO) למסד הנתונים כדי להביא את הנתונים החסרים, מה שיקריס את המערכת עם שגיאת MissingGreenlet. לכן, חובה עלינו להביא את כל הנתונים (ה-Datasets וה-DataTypes שלהם) מראש בשליפה הראשונית (Eager Loading). השאלה היא רק איך לעשות את זה.
+
+2. הקרב בין שתי השיטות: תיאוריה מול פרקטיקה
+הטקסט משווה בין שתי גישות לטעינה מוקדמת:
+
+שיטת selectin (ההמלצה הראשונית של קלוד): מבצעת שתי שאילתות נפרדות. הראשונה מביאה את ה-Datasets. השנייה עושה משהו כמו WHERE dataset_id IN (1,2,3) ומביאה את כל ה-DataTypes שלהם.
+
+שיטת joined: מבצעת שאילתה אחת בלבד שמשתמשת ב-JOIN כדי להביא טבלה "שטוחה" של אבות וילדים ביחד.
+
+"The alternative, lazy="selectin", splits this into two statements... Its advantage is that parent columns travel the wire once instead of once per member. Measured on this schema, that advantage does not pay for the extra round trip"
+
+ההסבר הפשוט:
+היתרון הגדול של selectin הוא חיסכון בשכפול נתונים. ב-joined, אם ל-Dataset יש 20 DataTypes, הנתונים של ה-Dataset (האבא) ישוכפלו 20 פעם בתוצאה שחוזרת מה-DB (כי ככה עובד SQL JOIN). selectin מונע את השכפול הזה כי הוא מביא את האבא פעם אחת בשאילתה הראשונה, ואת הילדים בשאילתה השנייה.
+אבל! הטקסט מציג טבלת ביצועים שמראה ש-joined מהיר פי 2 (למשל, 53ms לעומת 86ms). למה? בגלל זמן התקשורת. selectin דורש לדבר עם ה-DB פעמיים (Round Trip). זמן ההמתנה לתשובה הנוספת מהרשת יקר יותר מהיתרון של אי-שכפול הנתונים.
+
+3. משקל השורות (הסיבה האמיתית לניצחון של Joined)
+"The reason is the shape of these rows, not the row count. A data_sets row is id + name, about 29 bytes, while a data_types row carries the keyword array... duplication costs 116 KB against 1.99 MB of member data - 6% - and saves a full round trip."
+
+ההסבר הפשוט:
+זהו לב העניין. למה השכפול של joined לא פגע בביצועים? כי אובייקט ה-Dataset שלך הוא "רזה" מאוד. יש בו רק ID ושם (29 בייטים). לעומת זאת, ה-DataType ("הילד") הוא "שמן" (מכיל מערך של מילות מפתח).
+גם אם נשכפל את האבא הרזה 20 פעמים על כל ילד, סך המידע המיותר שנוסע ברשת הוא בקושי 6% מכלל המידע. לשלם 6% תוספת רוחב פס כדי לחסוך קריאת רשת נוספת ל-DB (Round trip) - זו עסקה מצוינת.
+
+(הטקסט מציין שאם ה-Dataset היה "שמן", למשל מכיל קובץ טקסט ענק, המשוואה הייתה מתהפכת ו-selectin היה מנצח).
+
+4. פתרון בעיית ה-Pagination (מלכודת ה-LIMIT)
+"...the parent query becomes a derived table so LIMIT counts Data Sets and not joined rows - the trap a hand-written JOIN ... LIMIT 3 falls into"
+
+ההסבר הפשוט:
+כשעושים JOIN, מספר השורות שחוזר גדל. אם יש לך 3 Datasets ולכל אחד 10 DataTypes, יחזרו 30 שורות מה-DB. אם תעשה LIMIT 3 פשוט, אתה תקבל רק את 3 הילדים הראשונים של ה-Dataset הראשון!
+כדי לפתור את זה, הקוד שלך (בעזרת SQLAlchemy) יוצר Subquery: הוא קודם כל עושה LIMIT 3 רק על ה-Datasets (בטבלה פנימית), ורק אחר כך עושה JOIN על התוצאה. ככה מבטיחים ש-LIMIT יספור "אבות" ולא שורות משוכפלות.
+
+5. השלכות שחובה ליישם בקוד
+הטקסט מציין שני דברים קריטיים שצריך לשים לב אליהם כשעוברים ל-joined:
+
+result.unique() הוא חובה:
+בגלל ש-JOIN מחזיר למשל 20 שורות עבור Dataset אחד, SQLAlchemy צריך "למעוך" (Collapse) אותן חזרה לאובייקט פייתון אחד שיש לו רשימה של 20 ילדים. אם לא תקרא לפונקציה .unique(), המערכת תזרוק שגיאה כדי למנוע ממך לקבל 20 אובייקטי Dataset זהים במקום אחד.
+
+חובה להשתמש ב-LEFT OUTER JOIN:
+אם היית משתמש ב-INNER JOIN, כל Dataset שאין לו DataTypes (רשימה ריקה) היה פשוט נעלם מהתוצאות! LEFT OUTER מבטיח שגם "אבא בלי ילדים" יחזור בשאילתה, וכך אפשר להבדיל בין מצב של "האובייקט קיים אבל אין לו ילדים" לבין "האובייקט לא קיים ב-DB בכלל" (שגיאת 404).
+
+6. למה לא להשתמש ב-PostgreSQL כדי לפתור את זה?
+"A third option exists and was rejected: PostgreSQL's json_agg can return one row per Data Set with the members nested in an array"
+
+ההסבר הפשוט:
+אפשר לגרום למסד הנתונים בעצמו לבנות אובייקט JSON שמכיל את האבא והילדים בצורה היררכית ללא שכפולים. למה פסלנו את זה? כי זה כלי ספציפי של Postgres (ואז אי אפשר להחליף DB בקלות), זה עוקף את מנגנון האובייקטים (ORM) של SQLAlchemy, והרווח הוא בסך הכל אותם 6% זניחים שדיברנו עליהם קודם. זה פשוט לא שווה את הסיבוך.
+
+ההבדל בשאילתות — לפני ואחרי
+שליפה בודדת: GET /api/datasets/{id}
+לפני — selectin, שתי שאילתות:
+
+
+-- 1
+SELECT data_sets.id, data_sets.name
+FROM data_sets
+WHERE data_sets.id = $1::UUID
+
+-- 2  (הלוך-חזור נוסף לרשת)
+SELECT data_sets_1.id, data_types.id, data_types.name, data_types.description,
+       data_types.type, data_types.content, data_types.threshold
+FROM data_sets AS data_sets_1
+JOIN dataset_data_types AS dataset_data_types_1 ON data_sets_1.id = dataset_data_types_1.dataset_id
+JOIN data_types                                 ON data_types.id  = dataset_data_types_1.data_type_id
+WHERE data_sets_1.id IN ($1::UUID)
+ORDER BY data_types.name
+אחרי — joined, שאילתה אחת:
+
+
+SELECT data_sets.id, data_sets.name,
+       data_types_1.id, data_types_1.name, data_types_1.description,
+       data_types_1.type, data_types_1.content, data_types_1.threshold
+FROM data_sets
+LEFT OUTER JOIN (dataset_data_types AS dataset_data_types_1
+                 JOIN data_types AS data_types_1
+                   ON data_types_1.id = dataset_data_types_1.data_type_id)
+  ON data_sets.id = dataset_data_types_1.dataset_id
+WHERE data_sets.id = $1::UUID
+ORDER BY data_types_1.name
+שים לב לשני שינויים מבניים: ה-JOIN עבר לתוך אותה שאילתה, והוא LEFT OUTER ולא INNER — וזה מה שמשמר את ההבחנה בין 404 לבין "קיים אך ריק".
+
+רשימה: GET /api/datasets?limit=2
+לפני — שתי שאילתות:
+
+
+-- 1
+SELECT data_sets.id, data_sets.name
+FROM data_sets ORDER BY data_sets.name
+LIMIT $1 OFFSET $2                              -- פרמטרים: (2, 0)
+
+-- 2
+SELECT data_sets_1.id, data_types.* ...
+FROM data_sets AS data_sets_1 JOIN ... JOIN ...
+WHERE data_sets_1.id IN ($1, $2)                -- שני המזהים שהתגלו בשאילתה 1
+ORDER BY data_types.name
+אחרי — שאילתה אחת, וכאן מופיעה התת-שאילתה שדיברנו עליה:
+
+
+SELECT anon_1.id, anon_1.name, data_types_1.id, data_types_1.name, ...
+FROM (SELECT data_sets.id AS id, data_sets.name AS name
+      FROM data_sets ORDER BY data_sets.name
+      LIMIT $1::INTEGER OFFSET $2::INTEGER) AS anon_1      ← הטבלה הנגזרת
+LEFT OUTER JOIN (dataset_data_types AS dataset_data_types_1
+                 JOIN data_types AS data_types_1
+                   ON data_types_1.id = dataset_data_types_1.data_type_id)
+  ON anon_1.id = dataset_data_types_1.dataset_id
+ORDER BY anon_1.name, data_types_1.name
+
+---
+
+## סבב 7 – בירור "באג" מדומה בלוגיקת ה-combine (2026-08-21)
+
+### ש18. תרחיש עם Data Type יחיד (content בעל 3 מילים, threshold=2) ו-combine="and" על טקסט שמכיל רק 2 מהמילים — זה לא אמור להחזיר not matched?
+
+תשובה: לא, וההרצה בפועל מול השרת מוכיחה זאת — `{"status":"match","match_count":2}`. הטעות
+היא בהנחה ש-`combine` שולט על מילות המפתח *בתוך* `content` של Data Type בודד. בפועל `combine`
+(`or`/`and`) קובע רק איך משלבים בין **כמה Data Types שונים** בתוך אותו Data Set. עם Data Type
+יחיד, OR ו-AND זהים מבחינה לוגית (ערך בוליאני יחיד עם עצמו), ולכן אין שום השפעה.
+
+בתוך Data Type בודד הכלל הוא **סך ההופעות** של כל המילים ברשימה (ראו סבב 2 ש2-ש3), לא "כל
+מילה חייבת להופיע". הטקסט `"my ssn, my passport"` תורם הופעה אחת מ-`ssn` והופעה אחת
+מ-`passport` — סה"כ 2, בדיוק `threshold=2` — ולכן ההתאמה נכונה, למרות ש-`visa` חסר.
+
+כדי לבדוק בפועל AND/OR בין Data Types, נדרשים שני Data Types נפרדים באותו Data Set (למשל
+`DT_A=["ssn"]` ו-`DT_B=["passport","visa"]`, כל אחד עם threshold משלו) — רק אז `combine`
+משפיע בפועל על התוצאה.
+
+---
+
+## סבב 13 – Docker בפרויקט: מה יש כאן בדיוק ומה לומר בראיון (2026-08-21)
+
+**ש42. אני לא מבין Docker ולא רוצה להיות מובך. מה בעצם יש לי כאן?**
+
+הרבה פחות ממה שנדמה. **לא כתבת Dockerfile.** אין בפרויקט בנייה של image, אין הגדרות רשת ואין
+אורקסטרציה. יש קובץ אחד בן 20 שורות שמריץ image **רשמי** של פוסטגרס. לכן כל השאלות המאיימות —
+multi-stage builds, גודל image, layer caching — פשוט אינן רלוונטיות אליך.
+
+### שלושת המושגים שמספיקים
+
+- **Image** הוא תבנית לקריאה בלבד — כמו קובץ התקנה. `postgres:16-alpine` הוא image רשמי
+  שהורדת מהאינטרנט ולא בנית.
+- **Container** הוא מופע רץ של image — כמו תהליך. `dlp_postgres` הוא הקונטיינר שלך.
+- **Volume** הוא אחסון ששורד את מחיקת הקונטיינר. בלעדיו כל הנתונים נמחקים בכל הפעלה מחדש.
+
+ההבדל ממכונה וירטואלית: קונטיינר משתמש בקרנל של מערכת ההפעלה המארחת ומריץ רק את התהליך עצמו,
+בעוד VM מריץ מערכת הפעלה שלמה. לכן קונטיינר עולה בשניות ולא בדקות.
+
+### הקובץ, שורה-שורה
+
+| השורה | מה היא עושה |
+|-------|-------------|
+| `image: postgres:16-alpine` | הורד את פוסטגרס 16 הרשמי. `alpine` היא גרסה מבוססת Alpine Linux, קטנה משמעותית |
+| `container_name: dlp_postgres` | שם קבוע לקונטיינר, כדי שאפשר יהיה לפנות אליו ב-`docker exec` |
+| `environment: POSTGRES_USER/PASSWORD/DB` | בהפעלה **ראשונה בלבד**, ה-image יוצר משתמש `dlp` ומסד נתונים `dlp` |
+| `ports: "5432:5432"` | ממפה את פורט 5432 של הקונטיינר לפורט 5432 במחשב, כדי שהאפליקציה תוכל להתחבר |
+| `volumes: dlp_pgdata:/var/lib/postgresql/data` | הנתונים נשמרים בדיסק ושורדים `restart` |
+| `volumes: ./scripts/init_test_db.sql:...` | סקריפט שרץ **פעם אחת**, ביצירת ה-volume, ויוצר את מסד `dlp_test` לטסטים |
+| `healthcheck: pg_isready` | דרך לדעת מתי פוסטגרס מוכן לקבל חיבורים, ולא רק "התהליך עלה" |
+
+### הפקודות שבאמת צריך
+
+```bash
+docker compose up -d          # הרם את מסד הנתונים ברקע (בטוח להריץ שוב ושוב)
+docker compose ps             # האם הוא רץ? מה מצב ה-healthcheck?
+docker compose logs db        # מה הוא אומר, אם משהו נשבר
+docker compose down           # עצור. הנתונים נשארים ב-volume
+docker compose down -v        # עצור ומחק גם את הנתונים. איפוס מלא
+docker exec -it dlp_postgres psql -U dlp -d dlp   # פתח psql בתוך הקונטיינר
+```
+
+הערה מעשית: הקונטיינר עלול להיעצר (למשל בכיבוי הסביבה), ואז הטסטים ייכשלו עם
+`Connect call failed ('127.0.0.1', 5432)`. הפתרון הוא תמיד `docker compose up -d` — הפקודה
+אידמפוטנטית ולא תיצור כפילות.
+
+**ש43. מה בדיוק לומר בראיון?**
+
+המשפט הפותח:
+
+> "לא בניתי image לאפליקציה — יש רק `docker-compose` שמריץ את ה-image הרשמי של פוסטגרס, כדי שמי
+> שמקבל את הפרויקט יריץ פקודה אחת ויקבל בדיוק את אותו מסד נתונים, באותה גרסה. אריזת שירות ה-API
+> עצמו הייתה השלב הבא."
+
+תשובות לשאלות המשך סבירות:
+
+- **"למה בכלל Docker?"** — כדי שהסביבה תהיה משוחזרת. בלעדיו כל מי שמריץ את הפרויקט צריך להתקין
+  פוסטגרס בעצמו ולקוות שהגרסה תואמת. עם compose זו פקודה אחת, וגרסה 16 מובטחת.
+- **"למה אין Dockerfile?"** — כי אין מה לבנות: אני לא משנה את ה-image של פוסטגרס. Dockerfile
+  היה נדרש לאריזת שירות ה-FastAPI, וזה תוכנן לאיטרציה הבאה.
+- **"מה זה ה-volume?"** — אחסון ששורד את הקונטיינר. בלעדיו כל `restart` היה מוחק את הנתונים.
+- **"מה זה ה-healthcheck?"** — פוסטגרס לוקח כמה שניות עד שהוא מקבל חיבורים. `pg_isready` מבדיל
+  בין "התהליך עלה" לבין "אפשר להתחבר", וזה מה שמונע מרוץ בין האפליקציה למסד.
+- **"איך היית ארוז את השירות?"** — Dockerfile מבוסס `python:3.12-slim`, התקנת `requirements.txt`
+  בשכבה נפרדת כדי לנצל cache, ואז הקוד; ו-`depends_on` עם `condition: service_healthy` כדי
+  שהשירות יעלה רק אחרי שמסד הנתונים מוכן.
+
+**ההנחיה החשובה ביותר:** אם נשאלת משהו שאינך יודע, "לא בניתי images בפרויקט הזה, השתמשתי ב-compose
+רק כדי להרים את התלות" היא תשובה לגיטימית ומלאה. **הודאה מדויקת בגבול הידע חזקה יותר מניחוש.**
+
+**ש44. שקלנו להסיר את Docker — מדוע לא?**
+מפני שההסרה **מקשה** על מי שמריץ את הפרויקט במקום להקל. שתי החלופות שנבחנו:
+
+- **פוסטגרס מקומי:** אפס שינויי קוד, אבל ה-README היה הופך ל"התקן פוסטגרס, צור שני מסדים",
+  והבודק היה נתקל בחיכוך גדול יותר.
+- **מעבר ל-SQLite:** מבטל את התשתית לגמרי, אבל דורש שינויי קוד אמיתיים — `ARRAY` היה הופך
+  ל-`JSON`, אילוץ `cardinality()` היה משתנה, והכי חשוב: SQLite מתעלם מ-`ON DELETE RESTRICT` אלא
+  אם מפעילים `PRAGMA foreign_keys=ON`, כלומר ה-409 היה נשבר בשקט. זה היה מחליש שתי החלטות
+  שמתועדות כאן כנימוקים מרכזיים (ש8 וש13).
+
+לכן ההחלטה: **להשאיר**, וללמוד את 20 השורות.
+
+
+
+---
+
+## סבב 14 – היררכיית הסכימות ואילוץ קרדינליות (2026-08-21)
+
+**ש45. מדוע סכימות ה-DataSet לא ירשו מ-`DataSetBase` כמו ב-DataType?**
+היו כאן שתי סיבות נפרדות, ורק אחת מהן מוצדקת.
+
+**המוצדקת:** `DataSetRead` **אינו יכול** לרשת את אילוץ הכתיבה. הרצתי את הניסוי — סכימת קריאה
+שיורשת `data_type_ids: Field(min_length=1)` נכשלת על קבוצה ריקה:
+`too_short - List should have at least 1 item after validation, not 0`. כלומר `GET` של Data Set
+ללא חברים היה מוחזר כ-500. וזה מצב שהוכח כאפשרי בסבב 11.
+
+**מדוע ל-`DataTypeRead` אין את הבעיה?** ל-`content` יש בדיוק אותו `min_length=1`, אבל שם
+**מסד הנתונים אוכף את אותו כלל** באמצעות `CHECK (cardinality(content) > 0)`, ולכן שורה כזו לא
+יכולה להתקיים. מכאן הכלל שנוסח: **אילוץ קלט יורש לסכימת הקריאה רק כשהוא גם אינווריאנטה של
+השורה המאוחסנת.**
+
+**הלא-מוצדקת:** פשוט לא היה `DataSetBase`. השדה `name` והוולידטור שלו משותפים לשלוש הסכימות,
+ו-`DataSetUpdate` ירש מ-`DataSetCreate` במקום מבסיס משותף. תוקן. ההיררכיה כעת:
+
+```
+DataSetBase                     ← name + _clean_name
+├── DataSetCreate               ← + data_type_ids  Field(min_length=1) + _unique_ids
+│   └── DataSetUpdate
+└── DataSetRead                 ← + id, + data_type_ids  ללא אילוץ
+```
+
+**ש46. האם כדאי להוסיף אילוץ קרדינליות ל-`DataSet.data_type_ids` ברמת ה-DB?**
+בדקתי שלוש דרכים בפועל. **ההמלצה: לא.**
+
+**דרך 1 — `CHECK`: בלתי אפשרי.** האילוץ צריך לספור שורות בטבלה **אחרת**, ופוסטגרס דוחה זאת:
+`ERROR: cannot use subquery in check constraint`. זה ההבדל המהותי מ-`cardinality(content) > 0`,
+שם המערך יושב **באותה שורה**.
+
+**דרך 2 — trigger רגיל: שובר את הזרימה התקינה.** ה-ORM מכניס קודם את שורת ה-Data Set ורק אחר כך
+את שורות הקישור, ולכן בזמן ה-`INSERT` עדיין אין חברים. יצירה **חוקית** לגמרי נכשלה:
+`asyncpg.exceptions.RaiseError: data set c6d42b29... has no members`.
+
+**דרך 3 — `CONSTRAINT TRIGGER ... DEFERRABLE INITIALLY DEFERRED`: עובד, אבל יקר.** נבדק ואכן
+יצירה תקינה עברה, קבוצה ריקה נחסמה, וגם `INSERT` ישיר ב-SQL נחסם. אבל:
+
+- הוא דורש פונקציית PL/pgSQL ו-trigger — קוד שאינו מתואר ב-SQLAlchemy ולכן לא נוצר על ידי
+  `create_all`. היה צריך מיגרציה ידנית, כלומר גם Alembic.
+- **הוא לא שלם.** הטריגר יושב על `data_sets`, ולכן מחיקת החבר האחרון מ-`dataset_data_types` לא
+  מפעילה אותו כלל — בדקתי, והמחיקה עברה והשאירה קבוצה ריקה. לכיסוי מלא נדרש טריגר שני על טבלת
+  הקישור, כולל `DELETE`.
+
+**הנימוק המכריע הוא חומרת הכשל, לא העלות.** קבוצה ריקה היא **חסרת תועלת** — סריקה מולה תמיד
+תחזיר `not matched`. לעומת זאת `threshold = 0` הוא **מסוכן** — הוא מסמן כל טקסט כהפרה ומציף
+false positives. שני אילוצי ה-CHECK הקיימים נוספו כי הם עלו שורה אחת והגנו מפני כשל מזיק; כאן
+המחיר הוא עשרות שורות PL/pgSQL ומיגרציה, מול כשל שאינו מזיק.
+
+בנוסף, חסימה ברמת ה-DB הייתה סותרת החלטה מכוונת: ה-`LEFT OUTER JOIN` בסעיף 5.4 קיים **בדיוק**
+כדי שקבוצה ריקה תוחזר כ-200 עם מערך ריק ולא תיראה כ-404. שכבת ה-API כבר אוכפת את הכלל ב-422,
+וזה הרובד הנכון עבור כלל שהוא של ה-API ולא של הנתונים.

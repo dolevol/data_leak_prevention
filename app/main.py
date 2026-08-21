@@ -50,8 +50,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Each router carries its own prefix, so the modules stay independent and appear
-# as separate groups in the generated OpenAPI documentation at /docs.
 app.include_router(datatypes.router)
 app.include_router(datasets.router)
 app.include_router(scan.router)

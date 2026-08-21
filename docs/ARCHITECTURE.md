@@ -1,10 +1,7 @@
 # Architecture — Simplified DLP Platform
 
-This document describes the system at five levels: user flows, endpoints, system design,
-data model, and the internal structure of the model and schema modules.
-
-The state described is the end of **iteration 1** (Data Type and Data Set management).
-The "Extension points" section explains what changes in the following iterations.
+This document describes the system at five levels: user flows (including the endpoint
+summary), system design, data model, core module structures and loading strategy.
 
 ---
 
@@ -12,6 +9,9 @@ The "Extension points" section explains what changes in the following iterations
 
 The two resources have genuinely different flows, so they are documented separately.
 Data Types are self-contained; Data Sets always depend on Data Types that already exist.
+
+<details>
+<summary><strong>Expand - 12 User Flows Diagrams (Data Types, Data Sets, Scan, Backend endpoints)</strong></summary>
 
 ### 1.1 Data Types
 
@@ -102,7 +102,7 @@ flowchart LR
     A["Client sends<br/>limit, offset"] --> B{"Bounds valid?"}
     B -- "no" --> B1["422"]
     B -- "yes" --> C["SELECT ... ORDER BY name"]
-    C --> D["Second SELECT loads<br/>all members at once (selectin)"]
+    C --> D["Same SELECT already carries<br/>the members (LEFT OUTER JOIN)"]
     D --> E["200 OK<br/>each item flattened by from_model"]
 ```
 
@@ -172,9 +172,7 @@ flowchart LR
     J -- "yes" --> J2["200<br/>{status: match, detected_objects}"]
 ```
 
----
-
-## 2. Backend endpoints
+### 1.4 Backend endpoints
 
 Two logical modules, each with full CRUD. The verb decides the operation, the path decides
 the identity — no `/create` or `/delete` ever appears in a URL.
@@ -207,16 +205,13 @@ flowchart LR
 | 409 | Duplicate name, or deleting a Data Type that is still in use | Database constraints, via `ConflictError` |
 | 500 | A CHECK constraint fired — the schemas failed to catch bad input, i.e. a bug | Re-raised `IntegrityError` |
 
+</details>
+
 ---
 
-## 3. System design
+## 2. System design
 
-The service is organized into four **layers**. Presentation, Business and Persistence sit in a
-single vertical stack — the main spine, request in, query out, top to bottom. Support is drawn
-as a column running alongside that whole stack rather than a fourth rung under it, because
-`deps.py`, `constants.py` and `config.py` are cross-cutting: every other layer reaches into them
-sideways, none of them calls the next in sequence. Grouping the three into one rubric also cuts
-down the clutter of having them scattered as separate boxes around the diagram.
+The service is organized into four **layers**. Presentation, Business, Persistence and Support.
 
 ```mermaid
 flowchart TD
@@ -238,7 +233,7 @@ flowchart TD
             subgraph L2 ["Business layer — data access and inspection logic"]
                 direction LR
                 Crud["app/crud.py<br/>every database query,<br/>no HTTP knowledge"]
-                Matchers["app/matchers.py<br/>counting functions,<br/>thresholds, OR/AND"]
+                Matchers["app/matchers.py<br/>counting functions,<br/>thresholds, OR across Data Types"]
             end
 
             subgraph L3 ["Persistence layer"]
@@ -283,8 +278,7 @@ flowchart TD
 The purple arrows are the paths a request actually walks. A CRUD request follows the spine
 `Client → Main → Routers → Crud → Models → Db → PostgreSQL`; a scan request branches at the
 routers into `Matchers` instead, because the Data Types it inspects were already loaded by
-`crud`. Every dashed arrow is a dependency that is reached into sideways — the Support layer, the
-schemas, and the ORM classes `matchers` is merely typed against — not a step in any request path.
+`crud`. Every dashed arrow is a dependency that is reached into sideways.
 
 | Layer | Modules | Role |
 |-------|---------|------|
@@ -293,30 +287,93 @@ schemas, and the ORM classes `matchers` is merely typed against — not a step i
 | Persistence | `models.py`, `db.py` | The ORM tables, constraints, engine and session factory |
 | Support | `deps.py`, `constants.py`, `config.py` | Cross-cutting: dependency injection, shared limits, environment settings — reached into by the other three, never called in sequence |
 
-Life cycle of a single request:
+### Life cycle of a single request
 
-1. The JSON body is parsed into a Pydantic schema (`*Create`/`*Update`). Invalid input stops
-   here as 422.
-2. FastAPI injects an `AsyncSession` through the `get_session` dependency (exposed to the
-   routers as `SessionDep`).
-3. The router calls a `crud` function, which runs the query and commits.
-4. The ORM object(s) `crud` returns are rebuilt into the response schema (`*Read`) — either
-   automatically, through `response_model` and `from_attributes` (`DataTypeRead`), or
-   explicitly, through `from_model` (`DataSetRead`, since the wire shape is not the storage
-   shape) — or a domain exception is converted to a status code by an exception handler instead.
-5. The `*Read` schema is serialized to JSON and sent as the response body.
-6. The session closes and returns its connection to the pool, even if the request failed.
+Traced end to end on `POST /api/datatypes`, the write path that exercises every stage. The
+sequence below is what the code actually does:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant F as FastAPI
+    participant S as schemas.py
+    participant R as routers
+    participant U as crud.py
+    participant O as ORM session
+    participant P as pool / db.py
+    participant G as PostgreSQL
+
+    C->>F: POST /api/datatypes {json}
+    F->>S: validate into DataTypeCreate
+    S-->>F: schema object (or 422, endpoint never runs)
+    F->>P: resolve get_session
+    P-->>F: AsyncSession (no connection yet)
+    F->>R: call endpoint(payload, session)
+    R->>U: create_data_type(session, payload)
+    U->>U: payload.model_dump() -> dict
+    U->>O: DataType(**dict) — in memory, id still None
+    U->>O: session.add() — pending, still no SQL
+    U->>O: commit()
+    O->>P: check out a connection (first real need)
+    P->>G: BEGIN
+    O->>G: INSERT ... VALUES ($1::UUID, ...)
+    O->>G: COMMIT
+    G-->>O: ok
+    U-->>R: DataType with id populated
+    R-->>F: ORM object
+    F->>S: response_model -> DataTypeRead
+    S-->>C: 201 Created {json}
+    F->>P: close session, return connection
+    P->>G: ROLLBACK (reset before reuse)
+```
+
+**Phase 1 — HTTP text becomes a validated Python object.**
+FastAPI reads the body, parses the JSON into a `dict`, and hands it to Pydantic, which builds a
+`DataTypeCreate`. This is where coercion happens (`"keywords"` becomes `InspectionType.KEYWORDS`)
+and where every validator in `schemas.py` runs. Invalid input is rejected as 422 **before the
+endpoint function is entered at all**.
+
+**Phase 2 — dependencies are resolved.**
+FastAPI walks the endpoint signature, sees `SessionDep`, runs `get_session` up to its `yield`, and
+passes the resulting `AsyncSession` in as an argument.
+
+**Phase 3 — Pydantic object becomes an ORM object.**
+Two lines in `crud.create_data_type` do the whole translation:
+
+```python
+data_type = DataType(**payload.model_dump())
+session.add(data_type)
+```
+
+**Phase 4 — first contact with the database.**
+`commit()` is the moment everything deferred becomes real.
+
+
+**Phase 5 — ORM object becomes the response.**
+`crud` returns the live `DataType`, whose attributes are still loaded because the session factory
+sets `expire_on_commit=False`.
+
+FastAPI then re-validates that object against `response_model`. For Data Types this is automatic
+via `from_attributes`; for Data Sets it is the explicit `DataSetRead.from_model`, because the
+stored shape is not the wire shape. Either way `response_model` acts as a whitelist: an attribute
+the schema does not declare cannot reach the client.
+
+**Phase 6 — teardown.**
+FastAPI resumes `get_session` past its `yield`, the `async with` block closes the session, and the
+connection goes back to the pool. The pool issues a `ROLLBACK` on return regardless of outcome, so
+no transaction state can leak into whichever request borrows that connection next.
+
+**The read path in one line.** A `GET` skips phase 3 entirely and inverts phase 4: `crud` issues a
+`SELECT` (which opens the transaction implicitly, exactly as an `INSERT` would), never calls
+`commit`, and the session closes with the pool's `ROLLBACK`.
 
 ---
 
-## 4. Data model
+## 3. Data model
 
 The relationship between Data Sets and Data Types is many-to-many, so it is implemented with an
-association table rather than a single foreign key. The full reasoning is in `QA.md`, Q8.
-
-The diagram below is a Mermaid **`erDiagram`** — an entity-relationship diagram. It is not an
-error report; `erDiagram` is simply Mermaid's keyword for this diagram type. `PK` marks a primary
-key, `FK` a foreign key and `UK` a unique key.
+association table rather than a single foreign key.
 
 ```mermaid
 erDiagram
@@ -346,16 +403,7 @@ erDiagram
 Both relationship labels describe the **same** association table, read from its two ends - there
 is no second relationship hiding here. A row in `DATASET_DATA_TYPES` says "this Data Set includes
 this Data Type"; looking at it from the Data Set you call it a member, looking at it from the Data
-Type you call it a membership. The earlier wording ("contains" / "is referenced by") suggested two
-different things and was simply confusing.
-
-There is deliberately **no direct line** between `DATA_SETS` and `DATA_TYPES`. That is how a
-many-to-many relationship is drawn: it cannot exist as one foreign key, so it is decomposed into
-two one-to-many relationships that meet at the link table.
-
-Reading the crow's-foot notation: `||--o{` means "exactly one on the left, zero or more on the
-right". One Data Type may appear in zero, one or many association rows, and so may one Data Set —
-which together is exactly a many-to-many relationship.
+Type you call it a membership.
 
 The association table has a **composite primary key** over both columns. That serves two purposes
 at once: it identifies the row, and it makes linking the same Data Type to the same Data Set twice
@@ -370,9 +418,9 @@ The two delete policies express a business decision:
 
 ---
 
-## 5. Module structure
+## 4. Module structure
 
-### 5.1 `app/models.py`
+### 4.1 `app/models.py`
 
 ```mermaid
 classDiagram
@@ -395,7 +443,7 @@ classDiagram
         +UUID id
         +str name
         +list~DataType~ data_types
-        relationship(secondary, lazy="selectin")
+        relationship(secondary, lazy="joined")
     }
     class dataset_data_types {
         <<Table>>
@@ -407,7 +455,7 @@ classDiagram
     dataset_data_types ..> DataType : links
 ```
 
-### 5.2 `app/schemas.py`
+### 4.2 `app/schemas.py`
 
 Each resource follows the same three-way split: `*Create` and `*Update` describe what may come
 in, `*Read` describes what goes out. `*Base` holds the fields and validators shared by the write
@@ -435,20 +483,23 @@ classDiagram
     DataTypeBase <|-- DataTypeUpdate
     DataTypeBase <|-- DataTypeRead
 
-    class DataSetCreate {
+    class DataSetBase {
         +str name
-        +list~UUID~ data_type_ids
         _clean_name()
+    }
+    class DataSetCreate {
+        +list~UUID~ data_type_ids  Field(min_length=1)
         _unique_ids()
     }
     class DataSetUpdate
     class DataSetRead {
         +UUID id
-        +str name
-        +list~UUID~ data_type_ids
+        +list~UUID~ data_type_ids  unconstrained
         from_model(DataSet)
     }
+    DataSetBase <|-- DataSetCreate
     DataSetCreate <|-- DataSetUpdate
+    DataSetBase <|-- DataSetRead
 
     class ScanRequest {
         +str text
@@ -479,24 +530,25 @@ classDiagram
     ScanResult --> DetectedObject : lists
 ```
 
-The scan schemas break the `*Create` / `*Read` pattern on purpose: a scan creates nothing and
-reads no stored row, so its request and response are named after the operation instead of a
-resource. Two details carry real behaviour. `detected_objects` is nullable and the route is
-declared with `response_model_exclude_none`, which is what makes a miss serialize as exactly
-`{"status": "not matched"}` rather than carrying an empty array. And `combine` defaults to `OR`,
-so the field is optional and a client that never heard of it behaves exactly as the specification
-requires.
+Both resources now share the same `*Base` shape, but they draw the line in different places, and
+the reason is worth stating precisely: **a constraint may be inherited by the read schema only
+when it is also an invariant of the stored row.**
 
-Note the asymmetry. `DataTypeRead` inherits from the base and is built straight from the ORM
-object via `from_attributes`, because the stored shape and the wire shape are identical.
-`DataSetRead` does **not** inherit: the ORM exposes `data_types` (objects) while the API contract
-requires `data_type_ids` (a flat array), so `from_model` performs that translation explicitly.
+`DataTypeBase` holds every field, `content` and its `min_length=1` included, and `DataTypeRead`
+inherits all of it. That is safe because the database enforces the same rule -
+`CHECK (cardinality(content) > 0)` - so a Data Type with no keywords cannot exist to be read back.
 
-Two module-level helpers are shared by all validators: `_require_text` trims a mandatory string
-and rejects a blank one, `_optional_text` trims an optional string and collapses a blank one to
-`None`. `_dedupe` removes repeats while preserving order.
+`DataSetBase` holds only `name`. `data_type_ids` is declared twice on purpose: `DataSetCreate`
+constrains it with `Field(min_length=1)` because a Data Set with no members is a pointless
+*request*, while `DataSetRead` leaves it unconstrained because nothing in the database prevents
+such a *row*. Inheriting the request's constraint would turn a plain `GET` of a member-less Data
+Set into a 500.
 
-### 5.3 `app/matchers.py`
+`DataSetRead` is built by `from_model` rather than `from_attributes`, because the ORM
+exposes `data_types` (objects) while the contract requires `data_type_ids` (a flat array).
+
+
+### 4.3 `app/matchers.py`
 
 The whole inspection logic is one module of plain functions. It separates **mechanics** (how many
 times did a rule fire) from **policy** (is that enough, and how do the rules combine) - with a
@@ -524,125 +576,77 @@ classDiagram
     class Combine {
         <<str, Enum>>
         OR = "or"
-        AND = "and"
     }
     policy_functions --> _COUNTERS : looks up by data_type.type
     _COUNTERS --> counting_functions : holds
     policy_functions --> Combine : takes as an argument
 ```
 
-Adding an inspection logic is two lines: a function with the signature
-`(patterns: list[str], text: str) -> int`, and one entry in `_COUNTERS`. There is no protocol to
-implement, no base class to inherit, no class to instantiate and no file to create.
+## 5 Eager loading strategy
 
-Why the counting functions return a **number** and not a boolean: the threshold comparison is
-policy and belongs to `detect`, and the number is needed anyway - it is reported back as
-`match_count`.
+`DataSet.data_types` is declared `lazy="joined"`. Some form of eager loading is not optional in
+this service: touching a lazily-loaded collection would emit IO from an already-returned async
+context and raise `MissingGreenlet`. The choice is therefore *which* eager strategy, and it was
+made by measurement rather than by default.
 
-Why `combine` is an argument of `detect` rather than state on an object: the module holds no state
-at all, so there is nothing an object would carry. Passing it per call keeps OR/AND an open
-argument all the way up to the API request. An empty result always means "not matched", in either
-mode, so no caller has to know which mode was used.
+Both endpoints now issue exactly **one** statement. 
+1. Reading one Data Set:
 
-### Whole-word counting without regex
-
-The counting rule is expressed with plain string comparison rather than a compiled pattern:
-
-1. Both the text and the keyword are lower-cased once - that is the entire case-insensitivity rule.
-2. `str.find` walks the text, returning each occurrence left to right.
-3. Each occurrence is kept only if `_is_standalone` accepts it: the characters immediately before
-   and after must not be letters or digits (`str.isalnum()`).
-
-This is shorter to read than an escaped alternation, and it removes three classes of problem
-outright rather than defending against them:
-
-| Case | Why plain comparison handles it |
-|------|-------------------------------|
-| `a.b` must not match `axb` | `str.find` is literal; there are no metacharacters to escape |
-| `c++` must match standalone but not inside `c++11` | The character after the hit is a digit, which extends the token |
-| user-supplied keywords as a ReDoS vector | No pattern is ever compiled from user input |
-| `pass` must not match `password` | The neighbouring character is a letter, so the token continues |
-
-The underscore is deliberately **not** a word character here, which is the one place this rule
-departs from a regex `\b`. For a DLP service snake_case is a separator, not glue: `ssn_number`,
-`passport_id` and `credit_card_number` are precisely the field names sensitive data travels
-under, and missing `ssn` inside `ssn_number` would be a detection failure. A letter is a
-different case entirely - `password` is its own word, not `pass` with a separator attached.
-
-One deliberate semantic difference from an alternation pattern: **each keyword is counted
-independently**. Keywords that overlap on the same span - `credit` and `credit card` over
-"my credit card" - contribute one occurrence each, where a single alternation would have counted
-one. A keyword that is merely a prefix of a longer one is still never double counted, because the
-boundary check rejects it.
-
-There is no cache. Nothing is precomputed, so there is nothing to invalidate and no stale rule can
-ever be served.
-
-Counting is **synchronous**. Keyword matching is pure CPU work and a pointless `await` is noise.
-An LLM engine would be IO-bound; at that point the counting functions become `async def` and
-`_count` gains an `await` - one line per engine, decided deliberately rather than pre-emptively.
-
----
-
-## 6. Data conversion pipeline
-
-A value crosses two translation boundaries on its way in and two on its way out. Knowing which
-component owns which conversion is what makes a serialization bug findable.
-
-```mermaid
-flowchart LR
-    subgraph IN ["inbound - deserialization"]
-        direction TB
-        I1["raw bytes"] --> I2["dict<br/>request.json()"]
-        I2 --> I3["DataTypeCreate<br/>Pydantic validate + coerce"]
-        I3 --> I4["plain dict<br/>model_dump()"]
-        I4 --> I5["DataType ORM object<br/>in memory only"]
-        I5 --> I6["INSERT statement<br/>SQLAlchemy type layer"]
-        I6 --> I7["PostgreSQL binary protocol<br/>asyncpg encodes"]
-    end
-    subgraph OUT ["outbound - serialization"]
-        direction TB
-        O1["PostgreSQL binary protocol"] --> O2["Python values<br/>asyncpg decodes"]
-        O2 --> O3["DataType ORM object<br/>SQLAlchemy type layer"]
-        O3 --> O4["DataTypeRead<br/>response_model validation"]
-        O4 --> O5["JSON-able primitives<br/>model_dump(mode='json')"]
-        O5 --> O6["raw bytes"]
-    end
+```sql
+SELECT data_sets.id, data_sets.name, data_types_1.id, data_types_1.name, ...
+FROM data_sets
+LEFT OUTER JOIN (dataset_data_types AS dataset_data_types_1
+                 JOIN data_types AS data_types_1
+                   ON data_types_1.id = dataset_data_types_1.data_type_id)
+  ON data_sets.id = dataset_data_types_1.dataset_id
+WHERE data_sets.id = $1::UUID
+ORDER BY data_types_1.name
 ```
 
-What each boundary actually converts:
+2. Listing a few Datasets:
 
-| Boundary | Owner | Example |
-|----------|-------|---------|
-| JSON text to Python object | Pydantic | `"2"` becomes `2`, a string becomes `uuid.UUID`, `"keywords"` becomes `InspectionType.KEYWORDS` |
-| Python object to SQL value | SQLAlchemy type layer | `uuid.UUID` becomes a `uuid` column, `list[str]` becomes `text[]`, the enum becomes a VARCHAR through `values_callable` |
-| SQL value to Python object | SQLAlchemy type layer | the reverse, driven by the `Mapped[...]` annotations |
-| Python object to JSON text | Pydantic | `uuid.UUID` becomes a string, the enum becomes `"keywords"` |
+```sql
+SELECT anon_1.id, anon_1.name, data_types_1.id, ...
+FROM (SELECT data_sets.id, data_sets.name
+      FROM data_sets ORDER BY data_sets.name
+      LIMIT $1 OFFSET $2) AS anon_1
+LEFT OUTER JOIN (dataset_data_types AS dataset_data_types_1
+                 JOIN data_types AS data_types_1
+                   ON data_types_1.id = dataset_data_types_1.data_type_id)
+  ON anon_1.id = dataset_data_types_1.dataset_id
+ORDER BY anon_1.name, data_types_1.name
+```
 
-Two properties of the outbound path are easy to miss:
+The alternative, `lazy="selectin"`, splits this into two statements: one for the parents, then one
+for the members keyed on `WHERE parent_id IN (...)`. Its advantage is that parent columns travel
+the wire once instead of once per member. 
 
-* `response_model` runs a **second validation pass**. It is not decoration - it is a whitelist.
-  Any attribute the ORM object carries that the schema does not declare is dropped, which is what
-  stops an internal column from leaking into a response by accident.
-* `DataSetRead` breaks out of this pipeline on purpose. `from_attributes` matches schema fields to
-  ORM attributes **by name**, and the ORM has no `data_type_ids` attribute at all - it has
-  `data_types`, a list of objects. `from_model` is the explicit translation that bridges the gap.
+```sql
+-- 1
+SELECT data_sets.id, data_sets.name
+FROM data_sets ORDER BY data_sets.name
+LIMIT $1 OFFSET $2                         -- params (0,2)     
 
----
+-- 2
+SELECT data_sets_1.id, data_types.* ...
+FROM data_sets AS data_sets_1 JOIN ... JOIN ...
+WHERE data_sets_1.id IN ($1, $2)                -- The 2 params from Query 1
+ORDER BY data_types.name
+```
 
-## 7. Extension points
+Measured on this schema, that advantage does not pay for
+the extra round trip:
 
-The project is designed so that adding inspection types requires no rewrite:
+| Scenario | `selectin` | `joined` |
+|----------|-----------|----------|
+| One Data Set, 5 members | 1.46 ms | **0.81 ms** |
+| List of 30, 5 members each | 4.24 ms | **1.98 ms** |
+| List of 50, 20 members each | 16.43 ms | **11.39 ms** |
+| List of 200, 20 members each | 86.48 ms | **53.00 ms** |
 
-- `type` is an `InspectionType` enum with a single member. Adding `substring`, `regex`, `pattern`
-  or `llm` means adding a member.
-- `crud.py` contains no matching logic at all, so the engine can be replaced without touching a
-  single query.
-- The `_COUNTERS` dict in `app/matchers.py` maps `InspectionType -> counting function`. Adding an
-  engine is: one enum member, one function, one dict entry. No caller changes. Concretely, a regex
-  engine would read the same `content` column and reuse the same threshold and combine logic; an
-  LLM engine would additionally need the configuration column described below.
-- The `type` column is stored as VARCHAR with a CHECK constraint (`native_enum=False`) rather
-  than a native PostgreSQL ENUM, so adding a value is a constraint change and not an `ALTER TYPE`.
-- An LLM-based engine would additionally need a configuration column (for example `config JSONB`)
-  holding the prompt and model. It was left out for minimality; it is a one-column addition.
+The reason is the shape of these rows, not the row count. A `data_sets` row is `id` + `name`,
+about 29 bytes, while a `data_types` row carries the keyword array. Over 200 Data Sets with 20
+members each, duplicating the parent costs 116 KB against 1.99 MB of member data - **6%** - and
+saves a full round trip. The trade-off reverses when the parent is the wide side: replaying the
+same query with a 2 KB parent payload, `joined` took 20.7 ms against 12.7 ms for `selectin`'s two
+statements combined.

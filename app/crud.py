@@ -26,13 +26,10 @@ from app.schemas import DataSetCreate, DataSetUpdate, DataTypeCreate, DataTypeUp
 
 
 # PostgreSQL SQLSTATE codes, used to tell one constraint violation from another.
-# https://www.postgresql.org/docs/current/errcodes-appendix.html
 _UNIQUE_VIOLATION = "23505"
 _FOREIGN_KEY_VIOLATION = "23503"
 
 # Fallbacks for call sites where the violation is not expected to be reachable.
-# Reaching one means the assumption behind the call site is wrong, so the message
-# stays deliberately generic rather than guessing at a cause.
 _DEFAULT_UNIQUE_DETAIL = "a resource with these values already exists"
 _DEFAULT_REFERENCE_DETAIL = "resource is still referenced by another resource"
 
@@ -83,8 +80,6 @@ async def _commit(
     try:
         await session.commit()
     except IntegrityError as error:
-        # The transaction is aborted after a violation; it must be rolled back
-        # before the session can be used again.
         await session.rollback()
         # ``error.orig`` is the driver-level exception; asyncpg exposes ``sqlstate``.
         sqlstate = getattr(error.orig, "sqlstate", None)
@@ -108,7 +103,6 @@ async def _load_data_types(session: AsyncSession, ids: list[uuid.UUID]) -> list[
     Raises:
         MissingDataTypesError: If at least one identifier has no matching row.
     """
-    # A single IN query instead of one SELECT per id.
     result = await session.execute(select(DataType).where(DataType.id.in_(ids)))
     found = {data_type.id: data_type for data_type in result.scalars()}
     missing = [str(identifier) for identifier in ids if identifier not in found]
@@ -256,7 +250,7 @@ async def get_data_set(session: AsyncSession, data_set_id: uuid.UUID) -> DataSet
     Returns:
         DataSet | None: The Data Set, or None if it does not exist.
     """
-    # ``lazy="selectin"`` on the relationship loads the members automatically.
+    # ``lazy="joined"`` on the relationship pulls the members in the same statement.
     return await session.get(DataSet, data_set_id)
 
 
@@ -273,7 +267,10 @@ async def list_data_sets(session: AsyncSession, limit: int, offset: int) -> list
     """
     statement = select(DataSet).order_by(DataSet.name).limit(limit).offset(offset)
     result = await session.execute(statement)
-    return list(result.scalars())
+    # ``unique()`` is mandatory with a joined eager load of a collection: the JOIN returns one
+    # row per member, and this collapses them back into one object per Data Set. SQLAlchemy
+    # raises rather than guessing, so forgetting it is a loud error, not a silent duplicate.
+    return list(result.unique().scalars())
 
 
 async def update_data_set(
@@ -318,6 +315,5 @@ async def delete_data_set(session: AsyncSession, data_set_id: uuid.UUID) -> bool
     if data_set is None:
         return False
     await session.delete(data_set)
-    # Its association rows cascade away, so no constraint is expected to fire here.
     await _commit(session)
     return True

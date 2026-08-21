@@ -60,7 +60,6 @@ dataset_data_types = Table(
     # Deleting a Data Set silently drops its memberships: the links are worthless without it.
     Column("dataset_id", Uuid, ForeignKey("data_sets.id", ondelete="CASCADE"), primary_key=True),
     # Deleting a Data Type that is still in use is REFUSED by the database;
-    # app.crud turns that refusal into HTTP 409 (see docs/QA.md, Q1).
     Column("data_type_id", Uuid, ForeignKey("data_types.id", ondelete="RESTRICT"), primary_key=True),
 )
 
@@ -79,8 +78,6 @@ class DataType(Base):
 
     __tablename__ = "data_types"
 
-    # A CHECK constraint cannot be attached to a single column here because it is
-    # table scoped; __table_args__ is where SQLAlchemy expects table-level rules.
     # Reaching one of these means a validation bug upstream, so they surface as 500,
     # not as a client error - see the sqlstate handling in app.crud.
     __table_args__ = (
@@ -96,14 +93,15 @@ class DataType(Base):
     )
     # ``native_enum=False`` stores a VARCHAR guarded by a CHECK constraint instead of a
     # PostgreSQL ENUM type - adding a new inspection type later is then a constraint
-    # change rather than an ALTER TYPE. SQLAlchemy calls ``values_callable`` with the enum
-    # class itself (InspectionType), so iterating it yields the members and this stores
-    # their values - "keywords" - instead of the default, which would be the names.
+    # change rather than an ALTER TYPE. 
     type: Mapped[InspectionType] = mapped_column(
         SAEnum(
             InspectionType,
             native_enum=False,
             length=DT_INSPECTION_TYPE_LENGTH,
+            # SQLAlchemy calls ``values_callable`` with the enum
+            # class itself (InspectionType), so iterating it yields the members and this stores
+            # their values - "keywords" - instead of the default, which would be the names.
             values_callable=lambda enum_class: [member.value for member in enum_class],
         ),
         default=InspectionType.KEYWORDS,
@@ -127,11 +125,11 @@ class DataSet(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(MAX_NAME_LENGTH), unique=True, index=True)
-    # ``lazy="selectin"`` loads the members in one extra SELECT alongside the parent query.
-    # Without it, touching ``data_set.data_types`` would trigger a lazy load in async
-    # context and raise MissingGreenlet; it also avoids the N+1 problem when listing.
+    # ``lazy="joined"`` loads the members in the SAME statement as the parent, through a
+    # LEFT OUTER JOIN. Eager loading of some kind is mandatory here: touching
+    # ``data_set.data_types`` lazily would emit IO in async context and raise MissingGreenlet.
     data_types: Mapped[list[DataType]] = relationship(
         secondary=dataset_data_types,
-        lazy="selectin",
+        lazy="joined",
         order_by=DataType.name,
     )
