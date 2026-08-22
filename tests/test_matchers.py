@@ -3,7 +3,7 @@
 These tests touch no database and no HTTP layer, which is the point: the
 matching logic is decoupled enough to be exercised on its own. They cover the
 word-boundary edge cases that are hard to read from an API-level assertion, and
-the combine modes.
+the OR combination across Data Types.
 """
 
 import uuid
@@ -12,7 +12,6 @@ import pytest
 
 from app.matchers import UnsupportedInspectionTypeError, _count_keywords, detect
 from app.models import DataType, InspectionType
-from app.schemas import Combine
 
 
 def make_data_type(*keywords: str, name: str = "test", threshold: int = 1) -> DataType:
@@ -70,7 +69,7 @@ def test_punctuation_in_a_keyword_is_literal() -> None:
 
 
 def test_counts_total_occurrences_not_distinct_keywords() -> None:
-    """Repetitions count, per the decision recorded in docs/QA.md Q3."""
+    """Repetitions count"""
     assert _count_keywords(["ssn", "passport", "visa"], "passport, passport, passport") == 3
 
 
@@ -96,41 +95,22 @@ def test_detection_reports_id_name_and_count() -> None:
     assert detection.match_count == 2
 
 
-def test_or_matches_when_a_single_rule_fires() -> None:
-    """OR is satisfied by one rule, and reports only the rule that fired."""
+def test_matches_when_a_single_rule_fires() -> None:
+    """A Data Set matches when at least one rule fires, and reports only that rule."""
     fires = make_data_type("salary", name="Salary")
     silent = make_data_type("ssn", name="Identifiers")
 
-    detections = detect([fires, silent], "my salary", Combine.OR)
+    detections = detect([fires, silent], "my salary")
     assert [detection.name for detection in detections] == ["Salary"]
 
 
-def test_and_rejects_a_partial_hit() -> None:
-    """AND discards the whole scan unless every rule fired."""
-    fires = make_data_type("salary", name="Salary")
-    silent = make_data_type("ssn", name="Identifiers")
-
-    assert detect([fires, silent], "my salary", Combine.AND) == []
-
-
-def test_and_returns_every_rule_when_all_fire() -> None:
-    """AND reports all rules once all of them reached their thresholds."""
+def test_reports_every_rule_that_fires() -> None:
+    """More than one rule can fire on the same text, and both are reported."""
     first = make_data_type("salary", name="Salary")
     second = make_data_type("ssn", name="Identifiers")
 
-    detections = detect([first, second], "my salary and ssn", Combine.AND)
+    detections = detect([first, second], "my salary and ssn")
     assert sorted(detection.name for detection in detections) == ["Identifiers", "Salary"]
-
-
-def test_or_is_the_default_combine_mode() -> None:
-    """The specification requires OR, so it must not need to be asked for."""
-    fires = make_data_type("salary", name="Salary")
-    silent = make_data_type("ssn", name="Identifiers")
-
-    # Omitting the argument must behave exactly like asking for OR.
-    assert detect([fires, silent], "my salary") == detect(
-        [fires, silent], "my salary", Combine.OR
-    )
 
 
 def test_unregistered_inspection_type_is_rejected() -> None:

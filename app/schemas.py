@@ -35,7 +35,6 @@ def _dedupe(values: list) -> list:
     Returns:
         list: The list without repetitions, first occurrence kept.
     """
-    # dict preserves insertion order in Python 3.7+, so this is an ordered set.
     return list(dict.fromkeys(values))
 
 
@@ -85,7 +84,6 @@ class DataTypeBase(BaseModel):
     description: str | None = Field(default=None, max_length=MAX_DESCRIPTION_LENGTH)
     type: InspectionType = InspectionType.KEYWORDS
     content: list[str] = Field(min_length=1, max_length=DT_MAX_KEYWORDS)
-    # Threshold 0 would mark every text - including an empty one - as a violation.
     threshold: int = Field(ge=DT_MIN_THRESHOLD)
 
     @field_validator("name")
@@ -158,11 +156,16 @@ class DataTypeRead(DataTypeBase):
     id: uuid.UUID
 
 
-class DataSetCreate(BaseModel):
-    """Request body of ``POST /api/datasets``."""
+class DataSetBase(BaseModel):
+    """Fields every Data Set representation carries, in and out.
+
+    Only ``name`` lives here. ``data_type_ids`` deliberately does not: the write
+    schemas require it to be non-empty while the read schema must not - because
+    there might be a past direct access to DB that has written a dataset with an empty list of 
+    datatypes. So, the two declare it separately rather than sharing one constrained definition.
+    """
 
     name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
-    data_type_ids: list[uuid.UUID] = Field(min_length=1)
 
     @field_validator("name")
     @classmethod
@@ -176,6 +179,16 @@ class DataSetCreate(BaseModel):
             str: The trimmed name.
         """
         return _require_text(value, "name")
+
+
+class DataSetCreate(DataSetBase):
+    """Request body of ``POST /api/datasets``."""
+
+    # ``min_length`` is a rule of the *request*: a Data Set with no members could
+    # never match anything, so asking to create one is a client mistake (422).
+    # It is not an invariant of the stored row, which is why DataSetRead below
+    # declares the same field without it.
+    data_type_ids: list[uuid.UUID] = Field(min_length=1)
 
     @field_validator("data_type_ids")
     @classmethod
@@ -195,7 +208,7 @@ class DataSetUpdate(DataSetCreate):
     """Request body of ``PUT /api/datasets/{id}`` - a full replacement."""
 
 
-class DataSetRead(BaseModel):
+class DataSetRead(DataSetBase):
     """Representation returned for a Data Set.
 
     The storage shape (an association table) differs from the wire shape (a flat
@@ -203,12 +216,14 @@ class DataSetRead(BaseModel):
 
     Attributes:
         id: The server-generated identifier.
-        name: The Data Set label.
         data_type_ids: Identifiers of the referenced Data Types.
     """
 
     id: uuid.UUID
-    name: str
+    # Deliberately unconstrained, unlike the write schemas. Nothing in the database
+    # prevents a Data Set from having no members, so a stored one must always be
+    # serializable; inheriting the DataSetCreate ``min_length=1`` would turn such a row
+    # into a 500 on a plain GET.
     data_type_ids: list[uuid.UUID]
 
     @classmethod
@@ -249,7 +264,6 @@ class Combine(str, Enum):
     """
 
     OR = "or"
-    AND = "and"
 
 
 class ScanRequest(BaseModel):
@@ -263,8 +277,7 @@ class ScanRequest(BaseModel):
             and existing clients are unaffected.
     """
 
-    # The upper bound is the practical protection against a denial-of-service
-    # attempt; an empty text can never reach any threshold, so it is rejected too.
+    # The upper bound is the practical protection against a denial-of-service attempt
     text: str = Field(min_length=1, max_length=MAX_SCAN_TEXT_LENGTH)
     data_set_id: uuid.UUID
     combine: Combine = Combine.OR

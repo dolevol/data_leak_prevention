@@ -33,8 +33,7 @@ class Base(DeclarativeBase):
 
 
 # The engine holds a pool of connections; creating it does NOT open a connection yet.
-# ``pool_pre_ping`` sends a cheap SELECT 1 before reusing a pooled connection, which
-# prevents "server closed the connection unexpectedly" after the DB restarts.
+# ``pool_pre_ping`` sends a cheap SELECT 1 before reusing a pooled connection
 engine = create_async_engine(
     _settings.database_url,
     echo=_settings.db_echo,
@@ -42,8 +41,6 @@ engine = create_async_engine(
 )
 
 # ``expire_on_commit=False`` keeps ORM attributes loaded after ``commit()``.
-# In async code this is essential: an expired attribute would trigger a lazy
-# refresh during response serialization, outside the async context, and raise.
 SessionFactory = async_sessionmaker(engine, expire_on_commit=False)
 
 

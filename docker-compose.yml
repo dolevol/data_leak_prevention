@@ -1,5 +1,4 @@
 # Development infrastructure: the database only.
-# The API service itself is added in iteration 3, together with its Dockerfile.
 services:
   db:
     image: postgres:16-alpine

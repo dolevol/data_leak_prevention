@@ -78,7 +78,6 @@ def _count_keyword(keyword: str, text: str) -> int:
     Returns:
         int: Number of standalone occurrences.
     """
-    # A blank keyword is rejected by the API schemas; guard anyway, because
     # str.find("") reports a hit at every position.
     if not keyword:
         return 0
@@ -95,8 +94,8 @@ def _count_keyword(keyword: str, text: str) -> int:
 def _count_keywords(patterns: list[str], text: str) -> int:
     """Count whole-word keyword occurrences, repetitions included.
 
-    Counting total occurrences rather than distinct keywords is the decision
-    recorded in docs/QA.md Q3: it matches the "minimum occurrences" semantics of
+    Counting total occurrences rather than distinct keywords
+    because it matches the "minimum occurrences" semantics of
     commercial DLP dictionaries, and keeps the reported ``match_count``
     identical to the number the threshold was compared against.
 
@@ -114,13 +113,11 @@ def _count_keywords(patterns: list[str], text: str) -> int:
         int: Total number of whole-word occurrences.
     """
     # Lower-casing both sides once is the whole of the case-insensitivity rule.
-    # A DLP engine that misses "PASSWORD" is worthless.
     lowered_text = text.lower()
     return sum(_count_keyword(keyword.lower(), lowered_text) for keyword in patterns)
 
 
-# The extension point: one entry per inspection logic. A new engine is a
-# function above with the same signature, plus one line here.
+# The extension point: one entry per inspection logic
 _COUNTERS: dict[InspectionType, Callable[[list[str], str], int]] = {
     InspectionType.KEYWORDS: _count_keywords,
 }
@@ -180,8 +177,8 @@ def detect(
         data_types: The rules of the Data Set being scanned.
         text: The input to inspect.
         combine: OR (the default, as the specification requires) matches when at
-            least one Data Type reached its threshold. AND requires all of them
-            to. Passing it per call is what keeps the rule an open argument
+            least one Data Type reached its threshold. 
+            Passing it per call is what keeps the rule an open argument
             rather than a hard-coded one.
 
     Returns:
@@ -192,7 +189,4 @@ def detect(
         for data_type in data_types
         if (detection := _detect_one(data_type, text)) is not None
     ]
-    # Under AND a partial hit is no hit: the whole scan is discarded.
-    if combine is Combine.AND and len(detections) != len(data_types):
-        return []
     return detections
