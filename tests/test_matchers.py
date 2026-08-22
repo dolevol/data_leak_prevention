@@ -10,7 +10,7 @@ import uuid
 
 import pytest
 
-from app.matchers import UnsupportedInspectionTypeError, _count_keywords, detect
+from app.matchers import KeywordMatcher, UnsupportedInspectionTypeError, detect
 from app.models import DataType, InspectionType
 
 
@@ -49,7 +49,7 @@ def make_data_type(*keywords: str, name: str = "test", threshold: int = 1) -> Da
 )
 def test_whole_word_matching(keyword: str, text: str, expected: int) -> None:
     """Only standalone occurrences of a keyword are counted."""
-    assert _count_keywords([keyword], text) == expected
+    assert KeywordMatcher().count([keyword], text) == expected
 
 
 def test_symbol_keyword_is_not_swallowed_by_a_longer_token() -> None:
@@ -58,24 +58,24 @@ def test_symbol_keyword_is_not_swallowed_by_a_longer_token() -> None:
     Comparing the neighbouring characters handles this directly: after "c++" in
     "c++11" comes a digit, which extends the token, so the hit is rejected.
     """
-    assert _count_keywords(["c++"], "c++ is great") == 1
-    assert _count_keywords(["c++"], "c++11 only") == 0
+    assert KeywordMatcher().count(["c++"], "c++ is great") == 1
+    assert KeywordMatcher().count(["c++"], "c++11 only") == 0
 
 
 def test_punctuation_in_a_keyword_is_literal() -> None:
     """A dot in a keyword is a literal dot, never a wildcard."""
-    assert _count_keywords(["a.b"], "a.b") == 1
-    assert _count_keywords(["a.b"], "axb") == 0
+    assert KeywordMatcher().count(["a.b"], "a.b") == 1
+    assert KeywordMatcher().count(["a.b"], "axb") == 0
 
 
 def test_counts_total_occurrences_not_distinct_keywords() -> None:
     """Repetitions count"""
-    assert _count_keywords(["ssn", "passport", "visa"], "passport, passport, passport") == 3
+    assert KeywordMatcher().count(["ssn", "passport", "visa"], "passport, passport, passport") == 3
 
 
 def test_longer_keyword_wins_over_its_prefix() -> None:
     """Overlapping keywords are counted once, preferring the longer one."""
-    assert _count_keywords(["pass", "passport"], "passport") == 1
+    assert KeywordMatcher().count(["pass", "passport"], "passport") == 1
 
 
 def test_threshold_is_applied_per_data_type() -> None:

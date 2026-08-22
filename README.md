@@ -4,29 +4,51 @@ A single backend service that detects sensitive content in text. It lets you def
 **Data Types** (keyword-based inspection rules with a threshold), group them into
 **Data Sets** (policies), and scan text against them.
 
-The project is built with FastAPI on top of PostgreSQL, is synchronous for the user (and fully-async in the background).
+The project is built with FastAPI on top of PostgreSQL, is synchronous for the user (and fully-async in the background for I/O ).
+
+## Non-Trivial decisions that I have made:
+
+* I've decided to focus on scalability - for future matchers (regex, prefixes, llm etc.) or for future logics (AND instead of OR).
+* I've kept the modules decoupled by responsibility - `crud.py` has no HTTP knowledge and `matchers.py` has no DB knowledge - so the natural seam for splitting this into a policy-management service and a high-traffic scan microservice already exists, and neither module would need a rewrite. I'm deliberately not claiming it is "ready for microservices": an actual split would still have to solve the shared database, the `ON DELETE RESTRICT` that produces the 409, and the atomicity of creating a Data Set together with its members.
+* I've interpreted "fully-sync" as for the user's experience only (waits for the response). The backend has to be async due to the DB I/O actions (to free the CPU for many future scan requests).
+* I've chosen the following delete object policy: if a user tries to delete a datatype that is used by an existing dataset - I block the action. In contrast, when a user tries to delete a dataset, it is approved. The first case is problematic because it's too powerful (might damage too many policies). I know that the best approach is to enable a soft-delete of datatypes (with a revival option), but I've found it as a lower priority at this moment.
+* I've decided to use a junction table to represent the many-to-many relationship between datasets and datatypes. Therefore, when a user tries to delete a dataset - all the dataset-datatype relations are being deleted (CASCADE).
+* For getting datasets with their datatypes from DB - I've decided to use "joined" query (instead of the suggested thumb-rule "selectin" approach) because it's more efficient in any case (get list of datasets / get a dataset by ID). Dataset and Datatype scheme are thin (only few columns), so although "joined" creates a cartesian multiplication of rows  - it's pretty negligible comparing to 2 separated queries made by "selectin". I've compared the 2 approaches empirically with Claude (elaborated in ARCHITECTURE.md).  
+* The DB schema is created automatically at startup with "create_all". I know that a real production deployment would use Alembic instead for versioning, but it's an overkill for now (the db scheme and data are being reset all the time).
+* Docker files are heavy with in-line comments because the concept is new to me.
+* I've decided not to build a caching mechanism for DataSets/DataTypes nor a hashing & caching mechanism for Scans due to the project's scope.
+ 
 
 ## Requirements
 
-Python 3.12 or newer, plus Docker and docker-compose to run the database.
+Docker and docker-compose. Python 3.12 is needed only to develop or run the tests locally.
 
-## Installation and running
+## Running the whole stack
 
-Start the database and install the dependencies:
-
-```bash
-docker compose up -d              # PostgreSQL 16 on port 5432
-pip install -r requirements.txt
-```
-
-Then run the service:
+One command builds the API image, starts PostgreSQL, waits for it to become healthy, and then
+starts the service:
 
 ```bash
-uvicorn app.main:app --reload
+docker compose up -d --build
 ```
 
 Interactive documentation (Swagger UI) is served at http://127.0.0.1:8000/docs, and the liveness
 probe at http://127.0.0.1:8000/health.
+
+## Running the service locally instead
+
+Useful while developing, because `--reload` restarts on every edit. Only the database runs in
+Docker:
+
+```bash
+docker compose up -d db
+pip install -r requirements-dev.txt
+uvicorn app.main:app --reload
+```
+
+The default `DATABASE_URL` already points at `localhost:5432`, so nothing needs configuring.
+Inside Docker the compose file overrides it to `db:5432`, because `db` is the service name and
+that is how one container reaches another.
 
 Configuration is read from environment variables or a `.env` file (see `.env.example`):
 
@@ -44,9 +66,14 @@ The suite runs against a separate `dlp_test` database, created automatically whe
 initialises:
 
 ```bash
-docker compose up -d
+docker compose up -d db
+pip install -r requirements-dev.txt
 pytest -v
+docker compose down # add -v for data deletion
 ```
+
+The tests run on the host, not inside the container: the image ships runtime dependencies only,
+so it carries no test framework.
 
 ---
 
@@ -165,9 +192,3 @@ docs/               # ARCHITECTURE.md
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — user flows per operation, endpoints, system
   design, data model, module structure, and the extension points for further inspection types.
 
-## Non-Trivial decisions that I have made:
-
-1. I've chosen the following delete object policy: if a user tries to delete a datatype that is used by an existing dataset - I block the action. In contrast, when a user tries to delete a dataset, it is approved. The first case is problematic because it's too powerful (might damage too many policies). I know that the best approach is to enable a soft-delete of datatypes (with a revival option), but I've found it as a lower priority at this moment.
-2. I've decided to use a junction table to represent the many-to-many relationship between datasets and datatypes. Therefore, when a user tries to delete a dataset - all the dataset-datatype relations are being deleted (CASCADE).
-3. For getting datasets with their datatypes from DB - I've decided to use "joined" query (instead of the suggested thumb-rule "selectin" approach) because it's more efficient in any case (get list of datasets / get a dataset by ID). Dataset scheme is thin (only id and name), so although "joined" creates a cartesian multiplication of rows  - it's pretty negligible comparing to 2 separated queries made by "selectin". I've compared the 2 approaches empirically with Claude (elaborated in ARCHITECTURE.md).  
-4. The DB schema is created automatically at startup with "create_all". I know that a real production deployment would use Alembic instead, but it's an overkill for now.

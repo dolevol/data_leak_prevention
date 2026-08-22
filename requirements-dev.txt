@@ -1,0 +1,7 @@
+# Everything needed to develop and test locally: the runtime set plus the test tools.
+# Kept out of the image so the shipped container carries no test framework.
+-r requirements.txt
+
+pytest==8.3.4
+pytest-asyncio==0.25.0
+httpx==0.28.1

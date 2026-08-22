@@ -1,6 +1,34 @@
-# Development infrastructure: the database only.
+# The full stack: the API service and the database it depends on.
 services:
+  api:
+    # We build the image based on our Dockefile that sits in the same dir
+    build: .
+    container_name: dlp_api
+    environment:
+      # Here we connect the api container to the db container -
+      # using the @db generated IP by docker.
+      # We connect it from @api_container_ip_generated:whatever_port_is_generated
+      # to @db_container_ip_generated:5432
+      DATABASE_URL: postgresql+asyncpg://dlp:dlp@db:5432/dlp
+    ports:
+      # This is a port forwarding from our PC 8000 port to the api container 8000 port 
+      - "8000:8000"
+    depends_on:
+      db:
+        # Waits for the db healthcheck below to pass, not merely for the container to start.
+        # Without it create_all in the API lifespan would fail on a refused connection.
+        condition: service_healthy
+    healthcheck:
+      # urllib ships with Python, so this needs no curl and no extra layer in the image.
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s # interval between 2 healthchecks
+      timeout: 3s # limit to declare a retry as failed
+      retries: 5
+      start_period: 5s # offset until first healthcheck after startup
+
   db:
+    # We download the already built image of postgres, alpine is minimalist
     image: postgres:16-alpine
     container_name: dlp_postgres
     environment:
@@ -8,16 +36,31 @@ services:
       POSTGRES_PASSWORD: dlp
       POSTGRES_DB: dlp
     ports:
+      # Published so the test suite and psql can reach the database from the host.
+      # Because usually test env is external to the app container
+      # So we set a port forwarding from our computer to the db container's
       - "5432:5432"
     volumes:
+      # This is a Named Volume (need storage), so we need to declare it at module level
       - dlp_pgdata:/var/lib/postgresql/data
-      # Runs once, when the volume is initialized, to prepare the test database.
+
+      # This is a bind mount (do not need storage, just need to run from it).
+
+      # We need to create test db separately because postgres image can only create
+      # one db at startup - which is the app db (not test).
+
+      # We point at our computer's script that creates a db and we forward it to
+      # a place which runs the script at container's init.
+
+      # RO makes our computer's original script uneditable by the container.
       - ./scripts/init_test_db.sql:/docker-entrypoint-initdb.d/init_test_db.sql:ro
+      
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U dlp -d dlp"]
       interval: 5s
       timeout: 3s
       retries: 10
 
+# Here we declare to docker what named volume we'd like to use
 volumes:
   dlp_pgdata:

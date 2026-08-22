@@ -1,0 +1,17 @@
+# Everything here is excluded from the build context, which keeps the image small and
+# prevents a local file from silently ending up inside the container.
+.git/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+
+# Not needed at runtime: the tests, the docs and the compose file itself.
+tests/
+docs/
+scripts/
+*.md
+docker-compose.yml
+Dockerfile
+.dockerignore

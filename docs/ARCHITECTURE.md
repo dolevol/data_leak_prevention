@@ -164,10 +164,6 @@ flowchart LR
     G --> I{"combine mode"}
     H --> I
     I -- "OR (default)" --> J{"any detection?"}
-    I -- "AND" --> K{"did every<br/>Data Type fire?"}
-    K -- "no" --> L["discard all detections"]
-    K -- "yes" --> J
-    L --> J
     J -- "no" --> J1["200<br/>{status: not matched}"]
     J -- "yes" --> J2["200<br/>{status: match, detected_objects}"]
 ```
@@ -217,7 +213,7 @@ The service is organized into four **layers**. Presentation, Business, Persisten
 flowchart TD
     Client["HTTP client<br/>curl / Swagger UI"] --> Main
 
-    subgraph App ["single uvicorn process"]
+    subgraph App ["api container - single uvicorn process"]
         direction LR
 
         subgraph Core [" "]
@@ -233,7 +229,7 @@ flowchart TD
             subgraph L2 ["Business layer — data access and inspection logic"]
                 direction LR
                 Crud["app/crud.py<br/>every database query,<br/>no HTTP knowledge"]
-                Matchers["app/matchers.py<br/>counting functions,<br/>thresholds, OR across Data Types"]
+                Matchers["app/matchers.py<br/>BaseMatcher + one class per type,<br/>thresholds, OR across Data Types"]
             end
 
             subgraph L3 ["Persistence layer"]
@@ -257,7 +253,7 @@ flowchart TD
         Models --> Db
     end
 
-    Db --> PG[("PostgreSQL 16<br/>docker-compose")]
+    Db --> PG[("PostgreSQL 16<br/>db container")]
 
     %% Every solid request-path link is declared above, so the purple set below is
     %% the contiguous range 0-6. Dashed links go after it: appending one can never
@@ -550,36 +546,51 @@ exposes `data_types` (objects) while the contract requires `data_type_ids` (a fl
 
 ### 4.3 `app/matchers.py`
 
-The whole inspection logic is one module of plain functions. It separates **mechanics** (how many
-times did a rule fire) from **policy** (is that enough, and how do the rules combine) - with a
-function per logic and a dispatch dict, and no classes at all.
+One matcher class per inspection type. The module separates **mechanics** (how many times did a
+rule fire) from **policy** (is that enough, and how are the rules combined), and the class
+hierarchy is drawn along exactly that line.
 
 ```mermaid
 classDiagram
-    class counting_functions {
-        <<module level>>
-        _count_keywords(patterns, text) int
-        _count_substrings(...) : future
-        _count_regex(...) : future
-        _count_llm(...) : future
+    class BaseMatcher {
+        <<abstract>>
+        +count(patterns, text) int*
+        +detect(data_type, text) DetectedObject|None
     }
-    class _COUNTERS {
-        <<dict>>
-        InspectionType.KEYWORDS : _count_keywords
+    class KeywordMatcher {
+        +count(patterns, text) int
+        -_count_one(keyword, text) int
+        -_is_standalone(text, start, end) bool
     }
-    class policy_functions {
+    class SubstringMatcher {
+        <<future>>
+        +count(patterns, text) int
+    }
+    class RegexMatcher {
+        <<future>>
+        +count(patterns, text) int
+    }
+    class LlmMatcher {
+        <<future>>
+        +count(patterns, text) int
+    }
+    class _MATCHERS {
+        <<dict, one instance per type>>
+        InspectionType.KEYWORDS : KeywordMatcher()
+    }
+    class module_functions {
         <<module level>>
         detect(data_types, text, combine) list~DetectedObject~
-        _detect_one(data_type, text) DetectedObject|None
-        _count(data_type, text) int
+        _matcher_for(data_type) BaseMatcher
     }
-    class Combine {
-        <<str, Enum>>
-        OR = "or"
-    }
-    policy_functions --> _COUNTERS : looks up by data_type.type
-    _COUNTERS --> counting_functions : holds
-    policy_functions --> Combine : takes as an argument
+
+    BaseMatcher <|-- KeywordMatcher
+    BaseMatcher <|-- SubstringMatcher
+    BaseMatcher <|-- RegexMatcher
+    BaseMatcher <|-- LlmMatcher
+    _MATCHERS --> KeywordMatcher : holds an instance of
+    module_functions --> _MATCHERS : looks up by data_type.type
+    module_functions --> BaseMatcher : calls detect() on
 ```
 
 ## 5 Eager loading strategy
@@ -650,3 +661,53 @@ members each, duplicating the parent costs 116 KB against 1.99 MB of member data
 saves a full round trip. The trade-off reverses when the parent is the wide side: replaying the
 same query with a 2 KB parent payload, `joined` took 20.7 ms against 12.7 ms for `selectin`'s two
 statements combined.
+
+---
+
+## 6 Deployment
+
+The stack is two containers described by one `docker-compose.yml`.
+
+```mermaid
+flowchart LR
+    Host["host<br/>curl, browser, pytest"]
+    subgraph Net ["compose network"]
+        API["api container<br/>python:3.12-slim<br/>uvicorn on 0.0.0.0:8000<br/>user: appuser"]
+        DB[("db container<br/>postgres:16-alpine")]
+        API -->|"db:5432"| DB
+    end
+    Host -->|"localhost:8000"| API
+    Host -->|"localhost:5432<br/>tests, psql"| DB
+    DB -.->|"named volume"| V[("dlp_pgdata<br/>survives down")]
+```
+
+Four decisions in the image are worth naming:
+
+* **Layer order.** `requirements.txt` is copied and installed before `app/` is copied. Docker
+  invalidates every layer after the first changed one, so with this order a code edit reuses the
+  cached `pip install`; reversed, every edit would reinstall all dependencies. Verified: after
+  touching `app/main.py`, the rebuild reports `CACHED` for the pip layer.
+* **Runtime dependencies only.** `requirements.txt` holds what the service runs on; when developing or testing locally we use
+  `requirements-dev.txt` instead - which pulls it in and adds pytest and httpx
+* **Non-root.** The image creates `appuser` and switches to it. Containers run as root by
+  default, which means a process that escapes starts with root on whatever it reaches.
+* **`--host 0.0.0.0`.** uvicorn defaults to `127.0.0.1`, which inside a container is the
+  container's own loopback. The published port would then map to a socket nothing listens on.
+
+Two decisions in the compose file matter as much:
+
+* **`depends_on: condition: service_healthy`** makes the API wait for PostgreSQL to accept
+  connections, not merely to start. This is what the `pg_isready` health check was always for:
+  `create_all` runs in the lifespan, so an API that boots too early dies on a refused connection.
+* **`DATABASE_URL` is overridden to `db:5432`.** Inside the compose network the service name is
+  the hostname; `localhost` would point the API at itself. The default in `app/config.py` stays
+  `localhost`, so local development needs no configuration.
+
+Both containers declare a health check, so `docker compose ps` reports readiness rather than mere
+liveness. The API check uses `urllib` from the standard library, which avoids adding `curl` to the
+image for one line of work.
+
+What is deliberately **not** here: a multi-stage build (nothing is compiled, so there is no build
+stage to discard), a migration step (`create_all` runs in the lifespan; a real deployment would
+run Alembic first), and any secret management (the database password is a literal in the compose
+file, which is fine for a local stack and would not be in production).
