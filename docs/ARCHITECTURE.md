@@ -554,25 +554,33 @@ hierarchy is drawn along exactly that line.
 classDiagram
     class BaseMatcher {
         <<abstract>>
-        +count(patterns, text) int*
-        +detect(data_type, text) DetectedObject|None
+        +prepare(patterns, text, memo)
+        +count(patterns, text, memo) int*
+        +detect(data_type, text, memo) DetectedObject|None
     }
     class KeywordMatcher {
-        +count(patterns, text) int
-        -_count_one(keyword, text) int
+        +prepare(patterns, text, memo)
+        +count(patterns, text, memo) int
+        -_count_all(patterns, text) dict~str, int~
         -_is_standalone(text, start, end) bool
+    }
+    class Automaton {
+        <<pyahocorasick, built per scan>>
+        add_word(keyword)
+        make_automaton()
+        iter(text) hits
     }
     class SubstringMatcher {
         <<future>>
-        +count(patterns, text) int
+        +count(patterns, text, memo) int
     }
     class RegexMatcher {
         <<future>>
-        +count(patterns, text) int
+        +count(patterns, text, memo) int
     }
     class LlmMatcher {
         <<future>>
-        +count(patterns, text) int
+        +count(patterns, text, memo) int
     }
     class _MATCHERS {
         <<dict, one instance per type>>
@@ -585,13 +593,65 @@ classDiagram
     }
 
     BaseMatcher <|-- KeywordMatcher
+    KeywordMatcher ..> Automaton : builds once per scan
     BaseMatcher <|-- SubstringMatcher
     BaseMatcher <|-- RegexMatcher
     BaseMatcher <|-- LlmMatcher
     _MATCHERS --> KeywordMatcher : holds an instance of
     module_functions --> _MATCHERS : looks up by data_type.type
-    module_functions --> BaseMatcher : calls detect() on
+    module_functions --> BaseMatcher : calls prepare() then detect() on
 ```
+
+**How keywords are found.** `KeywordMatcher` works in two steps. An Aho-Corasick automaton finds
+every place where a keyword occurs as a substring, and `_is_standalone` then keeps only the hits
+that are whole words. The automaton is a tree with one node per character, shared by all the
+keywords; a space or a `+` is a character like any other, so `new york` and `c++` need no special
+case. For the keywords `my`, `ssn`, `and`, `passport`:
+
+```
+(root)
+  ├─ m ─ y*                              * = a keyword ends here
+  ├─ s ─ s ─ n*
+  ├─ a ─ n ─ d*
+  └─ p ─ a ─ s ─ s ─ p ─ o ─ r ─ t*
+```
+
+The text is read once, one character at a time, each character moving one step in the tree.
+When no step fits, a precomputed *failure link* jumps to the longest ending of what was just read
+that is also the beginning of some keyword - from `pass` to `ss`, the start of `ssn` - so the text
+is never re-read. The cost is O(text length + total keyword length + number of hits): the number
+of keywords does not multiply the length of the text.
+
+The automaton knows nothing about words, which is why `_is_standalone` stays. In `my passn` it
+reports `ssn` at index 5; the character before it is `a`, so the hit is discarded.
+
+**One pass per scan.** `detect` first hands each engine all of its patterns through `prepare`.
+`KeywordMatcher.prepare` lower-cases the text, builds one automaton from the keywords of every
+Data Type, reads the text once, and leaves a `keyword -> count` dict in the scan's `memo`. `count`
+then only adds up the entries of one Data Type. The `memo` is an argument rather than an
+attribute because the matchers in `_MATCHERS` are singletons shared by all requests - state on
+`self` would leak from one scan into the next. `prepare` is optional: an engine that does not
+override it simply does all its work in `count`.
+
+Measured on a 1 MB text (best of 7 runs), against the previous one-`str.find`-pass-per-keyword
+implementation. The two were also compared on 30,000 random scans and returned identical results.
+
+| Scenario | `str.find` per keyword | Aho-Corasick |
+|----------|------------------------|--------------|
+| 1 Data Type, 4 keywords that occur often | 23.5 ms | 23.6 ms |
+| 20 Data Types, 5 keywords each, none in the text | 54.0 ms | **3.4 ms** |
+| 20 Data Types, 20 keywords each, none in the text | 217.1 ms | **3.4 ms** |
+| 20 Data Types sharing the same 4 frequent keywords | 526.0 ms | **23.9 ms** |
+| 5 Data Types, 1000 keywords each (the validation maximum) | 2946.5 ms | **4.9 ms** |
+
+The first row shows where there is no gain: with few keywords and many hits, the time is spent on
+the per-hit boundary check, which both versions perform. The automaton is rebuilt on every scan;
+building it for 400 keywords takes 0.09 ms, so it is not cached.
+
+Two alternatives were measured and rejected. Splitting the text into words and looking keywords
+up in a dictionary costs a fixed 40 ms per 1 MB whatever the keywords are, and needs a second code
+path for `credit card` or `c++`. One regex alternation of all keywords took 148 ms with 400
+keywords, and reports non-overlapping matches only, so `york` inside `new york` is not counted.
 
 ## 5 Eager loading strategy
 
@@ -644,6 +704,45 @@ FROM data_sets AS data_sets_1 JOIN ... JOIN ...
 WHERE data_sets_1.id IN ($1, $2)                -- The 2 params from Query 1
 ORDER BY data_types.name
 ```
+
+**Why `joined` duplicates the parent and `selectin` does not.** A SQL result set is always one
+flat rectangle. `joined` asks for parents and members in the same rectangle, so each row is one
+(parent, member) pair and the parent columns are repeated on every member row. Take two Data
+Sets, `PII` with three members and `Finance` with two:
+
+```
+ data_sets.id | data_sets.name | data_types.id | data_types.name | content
+--------------+----------------+---------------+-----------------+---------------------
+ aaaa         | PII            | t1            | email           | {mail, address, ..}
+ aaaa         | PII            | t2            | phone           | {phone, mobile, ..}
+ aaaa         | PII            | t3            | ssn             | {ssn, social, ..}
+ bbbb         | Finance        | t4            | iban            | {iban, swift, ..}
+ bbbb         | Finance        | t5            | credit card     | {visa, card, ..}
+ └───────── duplicated ────────┘
+```
+
+The ORM collapses this back on arrival: it sees `aaaa` three times, builds one `DataSet`, and
+appends three `DataType` objects to its `data_types` list.
+
+`selectin` asks for two rectangles, so the parent columns appear only in the first one:
+
+```
+Query 1 - parents, each sent once       Query 2 - members of (aaaa, bbbb)
+
+ id   | name                             data_sets.id | data_types.id | name        | content
+------+---------                        --------------+---------------+-------------+-----------
+ aaaa | PII                              aaaa         | t1            | email       | {mail, ..}
+ bbbb | Finance                          aaaa         | t2            | phone       | {phone, ..}
+                                         aaaa         | t3            | ssn         | {ssn, ..}
+                                         bbbb         | t4            | iban        | {iban, ..}
+                                         bbbb         | t5            | credit card | {visa, ..}
+                                         └─ key only ─┘
+```
+
+Query 2 still repeats the parent `id` on every row, because the ORM needs it to know which
+`DataSet` each member belongs to. `selectin` therefore does not remove the duplication; it
+shrinks it to the key and drops every other parent column. The cost of `joined` grows with
+parent row width times member count, while the cost of `selectin` is one fixed extra round trip.
 
 Measured on this schema, that advantage does not pay for
 the extra round trip:

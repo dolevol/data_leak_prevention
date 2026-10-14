@@ -95,6 +95,60 @@ def test_detection_reports_id_name_and_count() -> None:
     assert detection.match_count == 2
 
 
+def test_the_text_is_read_once_for_the_whole_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """All rules of a scan share one pass over the text, yet each reports its own count."""
+    passes = []
+    original = KeywordMatcher._count_all
+
+    def spy(self: KeywordMatcher, patterns: list[str], text: str) -> dict[str, int]:
+        passes.append(patterns)
+        return original(self, patterns, text)
+
+    monkeypatch.setattr(KeywordMatcher, "_count_all", spy)
+    first = make_data_type("ssn", "visa", name="First")
+    # "SSN" differs only in case, so it is the same keyword as far as matching goes.
+    second = make_data_type("SSN", name="Second", threshold=2)
+
+    detections = detect([first, second], "ssn and SSN")
+    assert {detection.name: detection.match_count for detection in detections} == {
+        "First": 2,
+        "Second": 2,
+    }
+    assert passes == [["ssn", "visa", "SSN"]]
+
+
+def test_overlapping_keywords_are_each_counted() -> None:
+    """A keyword contained in another one is still counted on its own."""
+    matcher = KeywordMatcher()
+    assert matcher.count(["new york"], "in new york") == 1
+    assert matcher.count(["york"], "in new york") == 1
+    assert matcher.count(["new york", "york"], "in new york") == 2
+    # An occurrence may also overlap the next occurrence of the same keyword.
+    assert matcher.count(["a a"], "a a a") == 2
+
+
+def test_keyword_found_only_mid_word_is_rejected() -> None:
+    """The automaton finds "ssn" inside "passn"; the boundary check discards it."""
+    assert KeywordMatcher().count(["pass", "ssn"], "my passn") == 0
+
+
+def test_non_ascii_keyword_is_matched_by_character_position() -> None:
+    """Positions are counted in characters, so text beyond ASCII keeps its boundaries."""
+    assert KeywordMatcher().count(["סוד"], "זה סוד, לא סודי") == 1
+
+
+def test_no_keywords_counts_zero() -> None:
+    """An empty rule is not an error for the engine, it simply finds nothing."""
+    assert KeywordMatcher().count([], "ssn") == 0
+
+
+def test_memo_does_not_outlive_a_scan() -> None:
+    """Counts from one text never leak into the scan of another."""
+    data_type = make_data_type("ssn")
+    assert detect([data_type], "ssn ssn")[0].match_count == 2
+    assert detect([data_type], "nothing here") == []
+
+
 def test_matches_when_a_single_rule_fires() -> None:
     """A Data Set matches when at least one rule fires, and reports only that rule."""
     fires = make_data_type("salary", name="Salary")

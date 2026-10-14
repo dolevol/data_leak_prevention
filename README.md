@@ -17,6 +17,16 @@ The project is built with FastAPI on top of PostgreSQL, is synchronous for the u
 * The DB schema is created automatically at startup with "create_all". I know that a real production deployment would use Alembic instead for versioning, but it's an overkill for now (the db scheme and data are being reset all the time).
 * Docker files are heavy with in-line comments because the concept is new to me.
 * I've decided not to build a caching mechanism for DataSets/DataTypes nor a hashing & caching mechanism for Scans due to the project's scope.
+* The matching algorithm (`matchers.py`) is the result of the following decisions:
+  * I count the **total occurrences** of the keywords and not the number of distinct keywords. It matches the "minimum occurrences" meaning of commercial DLP products, and the `match_count` in the response is exactly the number that was compared against the threshold.
+  * I find the keywords with the **Aho-Corasick** algorithm (the `pyahocorasick` library): all the keywords of the Data Set are built into one tree of characters, and the text is read once while walking that tree. The scan time therefore depends on the length of the text and on the number of hits, and not on the number of keywords. On a 1 MB text, 20 Data Types with 20 keywords each went from 217 ms to 3.4 ms, and the allowed maximum (5 Data Types with 1000 keywords each) from 2.9 seconds to 4.9 ms. With only a few keywords there is no gain (23.5 ms before and after).
+  * The algorithm finds substrings, so I then check the characters on both sides of each hit to keep only whole words. I did not use a regex for either step: there is nothing to escape, a keyword that ends with a symbol (`c++`) is handled correctly, a keyword written by a user can never become a ReDoS pattern, and a keyword contained in another one (`york` inside `new york`) is still counted.
+  * An underscore is **not** part of a word. For DLP, snake_case is a separator: `ssn` must be found inside `ssn_number`.
+  * The text is lower-cased and read **once per scan** for all the Data Types together, so a keyword that several Data Types share is counted once and its count is reused.
+  * The counts of a scan live in a `memo` dict that `detect` creates for that single scan and passes to the matchers. I did not keep it on the matcher object, because the matchers are shared by all requests and the state would leak from one scan into the next.
+  * The tree is rebuilt on every scan and is not cached: building it for 400 keywords takes 0.09 ms, so a cache would add invalidation logic for no measurable gain.
+  * I deliberately did **not** stop counting once the threshold is reached. It is much faster on a text full of hits, but `match_count` would then always equal the threshold and stop carrying information.
+  * I also considered splitting the text into words and looking each keyword up in a dictionary. It needs no library, but it costs a fixed 40 ms per 1 MB even for a few keywords, and keywords such as `credit card` or `c++` need a second code path.
  
 
 ## Requirements

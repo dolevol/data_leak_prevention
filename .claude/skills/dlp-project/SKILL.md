@@ -57,7 +57,9 @@ Each of these is documented in `docs/QA.md` with the full reasoning and the reje
 | Delete a Data Set | Allowed, `ON DELETE CASCADE` on the links | Links are worthless without their owner |
 | Update semantics | `PUT` full replacement, not `PATCH` | Five fields; one validation schema instead of two |
 | Threshold counting | Total occurrences, not distinct keywords | Matches commercial "minimum occurrences"; keeps `match_count` equal to the compared number |
-| Whole-word matching | Plain `str.find` plus a boundary check, no regex | No metacharacters to escape, no `\b` failure on `c++`, no ReDoS from user keywords |
+| Whole-word matching | Aho-Corasick (`pyahocorasick`) finds substrings, then a boundary check; no regex | No metacharacters to escape, no `\b` failure on `c++`, no ReDoS from user keywords |
+| Keyword search cost | One automaton per scan over the keywords of all Data Types, built in `prepare`, counts kept in the scan `memo`; not cached | Measured: 20x20 keywords on 1 MB went 217 ms -> 3.4 ms; build is 0.09 ms for 400 keywords |
+| Early exit at the threshold | Rejected | `match_count` would always equal the threshold |
 | Underscore | **Not** a word character | For DLP, snake_case is a separator: `ssn` must be found inside `ssn_number` |
 | Eager loading | `lazy="joined"`, measured against `selectin` | The parent row is ~23 bytes and the children are wide, so duplication costs 6% and saves a round trip |
 | Schema creation | `create_all` in the lifespan | Alembic is overkill at this scope; documented as the production upgrade |
@@ -86,8 +88,11 @@ Each of these is documented in `docs/QA.md` with the full reasoning and the reje
 Three edits, no caller changes:
 
 1. Add a member to `InspectionType` in `app/models.py`.
-2. Add a `BaseMatcher` subclass in `app/matchers.py` implementing `count(patterns, text) -> int`.
+2. Add a `BaseMatcher` subclass in `app/matchers.py` implementing `count(patterns, text, memo=None) -> int`.
 3. Register one instance in `_MATCHERS`.
+
+Overriding `prepare(patterns, text, memo)` is optional: it lets an engine see the patterns of all
+its Data Types once per scan (this is how `KeywordMatcher` reads the text a single time).
 
 An LLM engine would additionally need a config column (for example `config JSONB`) and would turn
 `count` into `async def`, adding one `await` in `BaseMatcher.detect`.
@@ -98,7 +103,7 @@ An LLM engine would additionally need a config column (for example `config JSONB
 docker compose up -d --build        # whole stack: api on :8000, db on :5432
 docker compose up -d db             # database only, for local development
 pip install -r requirements-dev.txt # runtime deps plus pytest and httpx
-pytest -v                           # 60 tests: 20 datatypes, 11 datasets, 16 matchers, 13 scan
+pytest -v                           # 66 tests: 20 datatypes, 11 datasets, 22 matchers, 13 scan
 ```
 
 `docker compose up -d --build` is the acceptance check. Tests run on the host against the
