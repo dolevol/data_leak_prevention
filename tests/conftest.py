@@ -117,3 +117,21 @@ async def create_data_set(client: AsyncClient, *data_type_ids: str, name: str = 
 
 UNKNOWN_ID = str(uuid.uuid4())
 """A syntactically valid UUID that is guaranteed not to exist in the database."""
+
+PERFORMANCE_RESULTS: list[tuple[str, str, str]] = []
+"""Rows appended by ``test_performance.py`` and printed once the run ends."""
+
+
+def pytest_terminal_summary(terminalreporter) -> None:
+    """Print the performance table after the test results, when any were collected.
+
+    A pytest hook: pytest calls it once, after every test has run.
+
+    Args:
+        terminalreporter: pytest's object for writing to the terminal.
+    """
+    if not PERFORMANCE_RESULTS:
+        return
+    terminalreporter.section("scan performance - 1,000,000-character text")
+    for scenario, size, elapsed in PERFORMANCE_RESULTS:
+        terminalreporter.write_line(f"{scenario:<44} {size:<24} {elapsed}")

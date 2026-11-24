@@ -259,7 +259,7 @@ class Combine(str, Enum):
     """How the per-Data-Type outcomes are combined into a single verdict.
 
     It lives here, next to the other API enums, because it is a request field.
-    ``app.matchers`` imports it from this module, which keeps the dependency
+    ``app.policy`` imports it from this module, which keeps the dependency
     one-way: the engine knows the contract, the contract knows no engine.
     """
 

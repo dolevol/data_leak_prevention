@@ -5,7 +5,8 @@ the same HTTP response, never a job id to poll. It says nothing about the
 process topology - the service still scales by running several workers.
 
 The endpoint only loads, delegates and translates. The inspection logic itself -
-thresholds and the OR combination across Data Types - lives in ``app.matchers.detect``.
+thresholds and the OR combination across Data Types - lives in ``app.policy.evaluate``,
+which in turn asks ``app.engines`` to count the occurrences.
 
 Called by:
     ``app.main`` through ``app.include_router``.
@@ -15,7 +16,7 @@ from fastapi import APIRouter, HTTPException, status
 
 from app import crud
 from app.api.deps import SessionDep
-from app.matchers import detect
+from app.policy import evaluate
 from app.schemas import ScanRequest, ScanResult, ScanStatus
 
 router = APIRouter(prefix="/api/scan", tags=["Scan"])
@@ -45,7 +46,7 @@ async def scan_text(payload: ScanRequest, session: SessionDep) -> ScanResult:
     if data_set is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "data set not found")
 
-    detected = detect(data_set.data_types, payload.text)
+    detected = evaluate(data_set.data_types, payload.text, payload.combine)
     if not detected:
         return ScanResult(status=ScanStatus.NOT_MATCHED)
     return ScanResult(status=ScanStatus.MATCH, detected_objects=detected)

@@ -31,18 +31,19 @@ pytest · Docker Compose. Fully async end to end.
 
 ```
 app/main.py        FastAPI app, lifespan (create_all), exception handlers -> HTTP codes
-app/api/*.py       routers: HTTP only. Translate schema <-> crud/matchers, raise 404
+app/api/*.py       routers: HTTP only. Translate schema <-> crud/policy, raise 404
 app/api/deps.py    SessionDep, LimitDep, OffsetDep
 app/schemas.py     Pydantic contract and every validation rule
 app/crud.py        every database query. NO FastAPI import
-app/matchers.py    the inspection logic. NO SQLAlchemy or session reference
+app/policy.py      scan POLICY: thresholds, OR. NO SQLAlchemy session reference
+app/engines.py     scan MECHANICS: Engine.find(patterns, text) -> {pattern: count}. Never sees a Data Type
 app/models.py      ORM tables, constraints, the association table
 app/db.py          engine, session factory, get_session dependency
 app/config.py      Settings from environment
 app/constants.py   shared limits, imported by schemas, models and deps
 ```
 
-**The rule that must hold:** `crud.py` never learns about HTTP and `matchers.py` never learns
+**The rule that must hold:** `crud.py` never learns about HTTP and `policy.py`/`engines.py` never learn
 about the database. This is what the README's modularity claim rests on - verify it still holds
 before claiming it.
 
@@ -58,17 +59,17 @@ Each of these is documented in `docs/private/QA.md` with the full reasoning and 
 | Update semantics | `PUT` full replacement, not `PATCH` | Five fields; one validation schema instead of two |
 | Threshold counting | Total occurrences, not distinct keywords | Matches commercial "minimum occurrences"; keeps `match_count` equal to the compared number |
 | Whole-word matching | Aho-Corasick (`pyahocorasick`) finds substrings, then a boundary check; no regex | No metacharacters to escape, no `\b` failure on `c++`, no ReDoS from user keywords |
-| Keyword search cost | One automaton per scan over the keywords of all Data Types, built in `prepare`, counts kept in the scan `memo`; not cached | Measured: 20x20 keywords on 1 MB went 217 ms -> 3.4 ms; build is 0.09 ms for 400 keywords |
+| Keyword search cost | One automaton per scan over the keywords of all Data Types, one `Engine.find` call per type per scan with every pattern of that type; not cached | Measured: 20x20 keywords on 1 MB went 217 ms -> 3.4 ms; build is 0.09 ms for 400 keywords |
 | Early exit at the threshold | Rejected | `match_count` would always equal the threshold |
 | Underscore | **Not** a word character | For DLP, snake_case is a separator: `ssn` must be found inside `ssn_number` |
 | Eager loading | `lazy="joined"`, measured against `selectin` | The parent row is ~23 bytes and the children are wide, so duplication costs 6% and saves a round trip |
 | Schema creation | `create_all` in the lifespan | Alembic is overkill at this scope; documented as the production upgrade |
-| Combine mode | OR only; the `Combine` enum and the `detect` argument remain as the seam | AND was removed but must stay one enum member away |
-| Matching engine | `BaseMatcher` ABC + one subclass per type + `_MATCHERS` registry | Template Method: the base owns the threshold comparison, subclasses own `count` |
+| Combine mode | OR only; the `Combine` enum and the `evaluate` argument remain as the seam (re-confirmed by the user in phase 2) | AND was removed but must stay one enum member away |
+| Scan core | `engines.py` (stateless `Engine` ABC, `ENGINES` dict, `engine_for`) + `policy.py` (`evaluate`) | Chosen in phase 2 (2026-11-24) over keeping the memo design, per-scan instances, and one pass per Data Type (20x slower). Strategy + dict registry; no registry class, no Bridge. |
 
 ## Invariants - breaking any of these is a bug
 
-- `crud.py` imports no FastAPI; `matchers.py` references no session or SQLAlchemy.
+- `crud.py` imports no FastAPI; `policy.py` and `engines.py` reference no session; `engines.py` never imports `DataType`.
 - `list_data_sets` must call `result.unique()` before `scalars()`. A joined eager load of a
   collection returns one row per member, and SQLAlchemy raises rather than silently duplicating.
 - `expire_on_commit=False` on the session factory. Without it, reading an attribute after commit
@@ -90,17 +91,16 @@ Each of these is documented in `docs/private/QA.md` with the full reasoning and 
 
 ## Adding an inspection type - the extension path
 
-Three edits, no caller changes:
+Three edits, no change to `policy.py`:
 
-1. Add a member to `InspectionType` in `app/models.py`.
-2. Add a `BaseMatcher` subclass in `app/matchers.py` implementing `count(patterns, text, memo=None) -> int`.
-3. Register one instance in `_MATCHERS`.
+1. Add a member to `InspectionType` in `app/models.py` (this changes the CHECK constraint, so the
+   dev volume must be recreated, or a migration added).
+2. Add an `Engine` subclass in `app/engines.py` implementing
+   `find(patterns, text) -> dict[str, int]`, keyed by each pattern exactly as given.
+3. Register one instance in `ENGINES`.
 
-Overriding `prepare(patterns, text, memo)` is optional: it lets an engine see the patterns of all
-its Data Types once per scan (this is how `KeywordMatcher` reads the text a single time).
-
-An LLM engine would additionally need a config column (for example `config JSONB`) and would turn
-`count` into `async def`, adding one `await` in `BaseMatcher.detect`.
+An LLM engine would additionally need a config column (for example `config JSONB`) and an async
+`find`, adding one `await` in `policy._count`.
 
 ## Running and verifying
 
@@ -108,8 +108,9 @@ An LLM engine would additionally need a config column (for example `config JSONB
 docker compose up -d --build        # whole stack: api on :8000, db on :5432
 docker compose up -d db             # database only, for local development
 pip install -r requirements-dev.txt # runtime deps plus pytest and httpx
-pytest -v                           # 66 tests: 20 datatypes, 11 datasets, 22 matchers, 13 scan
-pytest -m unit                      # the 22 matcher tests, no database needed
+pytest -v                           # 73 tests: 20 datatypes, 11 datasets, 13 scan, 15 engines, 8 policy, 6 performance
+pytest -m performance               # 1 MB text vs up to 20,000 keywords, prints a timing table
+pytest -m unit                      # 28 tests (engines, policy, 5 performance), no database needed
 docker compose run --rm --build test  # whole suite in the Dockerfile's test stage (also what CI runs)
 ```
 

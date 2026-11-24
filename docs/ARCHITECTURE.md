@@ -1,7 +1,8 @@
 # Architecture — Simplified DLP Platform
 
-This document describes the system at five levels: user flows (including the endpoint
-summary), system design, data model, core module structures and loading strategy.
+This document describes the system in seven sections: user flows (including the endpoint
+summary), system design, the core scan logic, the data model, module structures, the loading
+strategy and deployment.
 
 ---
 
@@ -154,16 +155,12 @@ flowchart LR
 flowchart LR
     A["Client sends<br/>text, data_set_id"] --> B{"Schema valid?"}
     B -- "no" --> B1["422<br/>empty text, over 1 MB,<br/>malformed UUID"]
-    B -- "yes" --> C["Load Data Set<br/>+ its Data Types in one query"]
+    B -- "yes" --> C["crud: load Data Set<br/>+ its Data Types in one query"]
     C --> D{"Data Set exists?"}
     D -- "no" --> D1["404"]
-    D -- "yes" --> E["For each Data Type:<br/>pick its engine, count occurrences"]
-    E --> F{"count >= threshold?"}
-    F -- "no" --> G["skip this Data Type"]
-    F -- "yes" --> H["add to detected_objects"]
-    G --> I{"combine mode"}
-    H --> I
-    I -- "OR (default)" --> J{"any detection?"}
+    D -- "yes" --> E["policy step 1 - COUNT<br/>one engine call per type,<br/>all patterns together"]
+    E --> F["policy step 2 - JUDGE<br/>per Data Type: sum its patterns,<br/>compare with its threshold"]
+    F --> J{"any Data Type fired?<br/>(OR)"}
     J -- "no" --> J1["200<br/>{status: not matched}"]
     J -- "yes" --> J2["200<br/>{status: match, detected_objects}"]
 ```
@@ -229,7 +226,8 @@ flowchart TD
             subgraph L2 ["Business layer — data access and inspection logic"]
                 direction LR
                 Crud["app/crud.py<br/>every database query,<br/>no HTTP knowledge"]
-                Matchers["app/matchers.py<br/>BaseMatcher + one class per type,<br/>thresholds, OR across Data Types"]
+                Policy["app/policy.py<br/>POLICY: thresholds,<br/>OR across Data Types"]
+                Engines["app/engines.py<br/>MECHANICS: count occurrences,<br/>one Engine per type"]
             end
 
             subgraph L3 ["Persistence layer"]
@@ -248,7 +246,8 @@ flowchart TD
 
         Main --> Routers
         Routers --> Crud
-        Routers --> Matchers
+        Routers --> Policy
+        Policy --> Engines
         Crud --> Models
         Models --> Db
     end
@@ -256,11 +255,11 @@ flowchart TD
     Db --> PG[("PostgreSQL 16<br/>db container")]
 
     %% Every solid request-path link is declared above, so the purple set below is
-    %% the contiguous range 0-6. Dashed links go after it: appending one can never
+    %% the contiguous range 0-7. Dashed links go after it: appending one can never
     %% shift the styled indices again.
     Deps -.->|"injected into"| Routers
     Routers -.->|"validates with"| Schemas
-    Matchers -.->|"typed against"| Models
+    Policy -.->|"typed against"| Models
     Const -.-> Schemas
     Const -.-> Models
     Const -.-> Deps
@@ -268,18 +267,18 @@ flowchart TD
     Db -.->|"yields session"| Deps
 
     style Core fill:none,stroke:none
-    linkStyle 0,1,2,3,4,5,6 stroke:#7c3aed,stroke-width:3px
+    linkStyle 0,1,2,3,4,5,6,7 stroke:#7c3aed,stroke-width:3px
 ```
 
 The purple arrows are the paths a request actually walks. A CRUD request follows the spine
-`Client → Main → Routers → Crud → Models → Db → PostgreSQL`; a scan request branches at the
-routers into `Matchers` instead, because the Data Types it inspects were already loaded by
-`crud`. Every dashed arrow is a dependency that is reached into sideways.
+`Client → Main → Routers → Crud → Models → Db → PostgreSQL`; a scan request first loads its Data
+Set through that spine, then branches at the routers into `Policy → Engines`, which touch no
+database at all. Every dashed arrow is a dependency that is reached into sideways.
 
 | Layer | Modules | Role |
 |-------|---------|------|
 | Presentation | `main.py`, the routers, `schemas.py` | Owns the HTTP contract: routing, status codes, request/response shape |
-| Business | `crud.py`, `matchers.py` | Every query and domain rule (conflicts, missing references), plus the whole inspection logic (counting, thresholds, OR/AND) — no HTTP knowledge |
+| Business | `crud.py`, `policy.py`, `engines.py` | Every query and domain rule (conflicts, missing references); the scan verdict (thresholds, OR); and the counting itself — no HTTP knowledge |
 | Persistence | `models.py`, `db.py` | The ORM tables, constraints, engine and session factory |
 | Support | `deps.py`, `constants.py`, `config.py` | Cross-cutting: dependency injection, shared limits, environment settings — reached into by the other three, never called in sequence |
 
@@ -366,7 +365,272 @@ no transaction state can leak into whichever request borrows that connection nex
 
 ---
 
-## 3. Data model
+## 3. Core logic - `app/policy.py` and `app/engines.py`
+
+This is the heart of the service: how one scan turns a text and a Data Set into a verdict.
+
+### 3.1 Two questions, two files
+
+A scan asks two different questions, and each has its own file:
+
+| Question | File | Knows about | Never sees |
+|----------|------|-------------|------------|
+| How often does each pattern occur in the text? (**mechanics**) | `engines.py` | patterns, text | Data Types, thresholds, Data Sets |
+| Which Data Types fired? (**policy**) | `policy.py` | Data Types, thresholds, OR | how counting works |
+
+So "where is the logic of X" is always answered by a file name: a change to word boundaries is in
+`engines.py`, a change to how thresholds or AND/OR work is in `policy.py`.
+
+### 3.2 The flow of one scan
+
+Every module, class and function a scan passes through, top to bottom, with what goes in and what
+comes out of each. Solid arrows are calls, numbered in order; the dashed arrow is inheritance.
+`evaluate` works in two steps - **count**, then **judge** - and that order is what keeps the scan to
+a single pass over the text, however many Data Types the Data Set holds.
+
+The yellow stickers follow one real scan end to end - the README example: the text
+`my ssn, my passport and my visa` against a Data Set with one Data Type, `PII`, holding `ssn`,
+`passport`, `visa` with threshold 2. Every value was taken from running the code.
+
+```mermaid
+flowchart TD
+    C["Client<br/>POST /api/scan<br/>body: text, data_set_id, combine"]
+
+    subgraph SCAN ["module app/api/scan.py - HTTP layer"]
+        R["scan_text(payload, session)<br/>IN: ScanRequest, AsyncSession<br/>OUT: ScanResult"]
+    end
+
+    subgraph CRUD ["module app/crud.py - database"]
+        G["get_data_set(session, id)<br/>IN: AsyncSession, UUID<br/>OUT: DataSet with data_types, or None"]
+    end
+
+    subgraph POL ["module app/policy.py - POLICY"]
+        E["evaluate(data_types, text, combine)<br/>IN: list of DataType, str, Combine<br/>OUT: list of DetectedObject"]
+        CNT["_count(data_types, text)<br/>step 1 - COUNT<br/>IN: list of DataType, str<br/>OUT: type -> pattern -> int"]
+        J["judge loop inside evaluate<br/>step 2 - JUDGE<br/>per DataType: total = sum of its patterns<br/>fires when total >= threshold"]
+    end
+
+    subgraph ENG ["module app/engines.py - MECHANICS"]
+        EF["engine_for(inspection_type)<br/>IN: InspectionType<br/>OUT: Engine, or raises UnsupportedInspectionTypeError"]
+        REG["ENGINES - a dict<br/>KEYWORDS -> one shared KeywordEngine"]
+        ABC["class Engine - abstract<br/>find(patterns, text) -> pattern -> int"]
+        KE["class KeywordEngine<br/>find(patterns, text)<br/>IN: iterable of str, str<br/>OUT: pattern -> count, every pattern as given"]
+        ST["KeywordEngine._is_standalone(text, start, end)<br/>OUT: bool - is this hit a whole word?"]
+    end
+
+    subgraph LIB ["library pyahocorasick"]
+        AU["Automaton<br/>add_word, make_automaton, iter<br/>one pass over the text"]
+    end
+
+    subgraph SCH ["module app/schemas.py - response shapes"]
+        DO["DetectedObject<br/>id, name, match_count"]
+        SR["ScanResult<br/>status, detected_objects"]
+    end
+
+    C -->|"1"| R
+    R -->|"2 load"| G
+    R -->|"3 data_types, text, combine"| E
+    E -->|"4"| CNT
+    CNT -->|"5 which engine?"| EF
+    EF -->|"6 lookup"| REG
+    CNT -->|"7 find: all patterns of that type"| KE
+    KE -->|"8 build + walk"| AU
+    KE -->|"9 per hit"| ST
+    CNT -->|"10 counts"| J
+    J -->|"11 per fired DataType"| DO
+    E -->|"12 list of DetectedObject"| R
+    R -->|"13"| SR
+    KE -.->|"implements"| ABC
+
+    %% Invisible link: keeps the library box between engines.py and schemas.py.
+    AU ~~~ DO
+
+    %% Example stickers - declared last so they do not change the layout of the components.
+    X1>"EXAMPLE IN<br/>text: 'my ssn, my passport and my visa'<br/>data_set_id: 'a1b2...'<br/>combine: 'or'"]
+    X2>"EXAMPLE OUT<br/>DataSet 'HR Policy'<br/>data_types = [ PII ]<br/>PII.content = [ssn, passport, visa]<br/>PII.threshold = 2"]
+    X3>"EXAMPLE grouping<br/>patterns_by_type =<br/>KEYWORDS: {ssn, passport, visa}"]
+    X6>"EXAMPLE judge<br/>PII: 1 + 1 + 1 = 3<br/>3 >= 2  ->  fires"]
+    X4>"EXAMPLE<br/>IN: KEYWORDS<br/>OUT: the shared KeywordEngine()"]
+    X5>"EXAMPLE OUT of find<br/>{ssn: 1, passport: 1, visa: 1}"]
+    X7>"EXAMPLE hits - last index, keyword<br/>(5, ssn)  (18, passport)  (30, visa)"]
+    X8>"EXAMPLE<br/>_is_standalone(text, 3, 6)<br/>before ' '  after ','  ->  True"]
+    X9>"EXAMPLE<br/>DetectedObject(id='1111...', name='PII', match_count=3)"]
+    X10>"EXAMPLE OUT - HTTP 200<br/>{status: 'match',<br/>detected_objects: [{id: '1111...', name: 'PII', match_count: 3}]}"]
+
+    X1 -.- C
+    X2 -.- G
+    X3 -.- CNT
+    X4 -.- EF
+    X5 -.- KE
+    X7 -.- AU
+    X8 -.- ST
+    X6 -.- J
+    X9 -.- DO
+    X10 -.- SR
+
+    classDef example fill:#fff4c2,stroke:#d4a017,color:#3b2f00,stroke-dasharray: 4 3
+    class X1,X2,X3,X4,X5,X6,X7,X8,X9,X10 example
+```
+
+| Step | Module | Function or class | In | Out |
+|------|--------|-------------------|----|-----|
+| 1 | `api/scan.py` | `scan_text` | `ScanRequest` | `ScanResult` |
+| 2 | `crud.py` | `get_data_set` | Data Set id | `DataSet` with `data_types`, or `None` -> 404 |
+| 3-4 | `policy.py` | `evaluate`, which calls `_count` | Data Types, text, `combine` | list of `DetectedObject` |
+| 5-6 | `engines.py` | `engine_for` and the `ENGINES` dict | `InspectionType` | the engine for that type |
+| 7 | `engines.py` | `KeywordEngine.find` | every pattern of the type, text | `{pattern: count}` |
+| 8-9 | pyahocorasick, `engines.py` | `Automaton`, `_is_standalone` | lower-cased text | hits, then whole words only |
+| 10-11 | `policy.py` | the judge loop in `evaluate` | the counts, each Data Type | a `DetectedObject` per Data Type over its threshold |
+| 12-13 | `api/scan.py` | `scan_text` | list of `DetectedObject` | `match` with the list, or `not matched` |
+
+The same scan as a sequence, for a Data Set with two keyword Data Types - `First` with
+`[ssn, visa]` and `Second` with `[SSN]` and threshold 2 - and the text `"ssn and SSN"`. This is
+exactly the case `test_the_text_is_read_once_for_the_whole_scan` asserts:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as scan router
+    participant P as policy.evaluate
+    participant Reg as engine_for
+    participant K as KeywordEngine
+
+    R->>P: evaluate([First, Second], "ssn and SSN", OR)
+    P->>P: group patterns: KEYWORDS -> {ssn, visa, SSN}
+    P->>Reg: engine_for(KEYWORDS)
+    Reg-->>P: the shared KeywordEngine
+    P->>K: find({ssn, visa, SSN}, text)
+    Note over K: lower-case the text once<br/>build one automaton<br/>walk the text once
+    K-->>P: {ssn: 2, visa: 0, SSN: 2}
+    P->>P: First = ssn + visa = 2 >= 1 -> fires
+    P->>P: Second = SSN = 2 >= 2 -> fires
+    P-->>R: [First (2), Second (2)]
+```
+
+One call to `find` served both Data Types, and each still got its own total. `ssn` and `SSN` are
+one keyword for the engine, and the result answers both spellings, because the policy looks each
+count up with the Data Type's own `content`.
+
+### 3.3 Classes and design points
+
+```mermaid
+classDiagram
+    class Engine {
+        <<abstract>>
+        +find(patterns, text) dict~str, int~*
+    }
+    class KeywordEngine {
+        +find(patterns, text) dict~str, int~
+        -_is_standalone(text, start, end) bool
+    }
+    class Automaton {
+        <<pyahocorasick, built per call>>
+        add_word(keyword)
+        make_automaton()
+        iter(text) hits
+    }
+    class RegexEngine {
+        <<phase 3>>
+        +find(patterns, text) dict~str, int~
+    }
+    class ENGINES {
+        <<dict, one shared instance per type>>
+        InspectionType.KEYWORDS : KeywordEngine()
+    }
+    class engines_module {
+        <<module functions>>
+        engine_for(inspection_type) Engine
+    }
+    class policy_module {
+        <<module functions>>
+        evaluate(data_types, text, combine) list~DetectedObject~
+        _count(data_types, text) dict
+    }
+
+    Engine <|-- KeywordEngine
+    Engine <|-- RegexEngine
+    KeywordEngine ..> Automaton : builds once per find
+    ENGINES --> KeywordEngine : holds
+    engines_module --> ENGINES : looks up
+    policy_module --> engines_module : engine_for()
+    policy_module --> Engine : find()
+```
+
+Three design points are worth naming:
+
+* **Strategy.** Every engine is interchangeable behind one method, `find`, and the policy calls
+  them all the same way. The base class holds no shared logic: the threshold comparison is policy,
+  so it lives in `policy.py`.
+* **Stateless engines.** `find` keeps nothing on `self`: input in, dict out. One instance per type
+  can therefore be shared by every concurrent request, with no per-scan state to manage.
+* **A dict is the registry.** `ENGINES` maps a type to its engine, and `engine_for` wraps the
+  lookup so a missing entry is a named `UnsupportedInspectionTypeError` (HTTP 500 - a bug, not bad
+  input). A registry class would only pay off with runtime registration (plugins), validation on
+  register, or several registries; none of those exists.
+
+**Extension points.** A new inspection type is one `Engine` subclass plus one `ENGINES` entry;
+`policy.py` does not change. An AND mode is one branch in `evaluate` on its `combine` argument,
+which is already passed through from the request; `engines.py` does not change. The two axes grow
+independently - the idea behind the Bridge pattern, achieved by composition without a class
+hierarchy.
+
+### 3.4 How keywords are found - Aho-Corasick
+
+`KeywordEngine.find` works in two steps. An Aho-Corasick automaton finds
+every place where a keyword occurs as a substring, and `_is_standalone` then keeps only the hits
+that are whole words. The automaton is a tree with one node per character, shared by all the
+keywords; a space or a `+` is a character like any other, so `new york` and `c++` need no special
+case. For the keywords `my`, `ssn`, `and`, `passport`:
+
+```
+(root)
+  ├─ m ─ y*                              * = a keyword ends here
+  ├─ s ─ s ─ n*
+  ├─ a ─ n ─ d*
+  └─ p ─ a ─ s ─ s ─ p ─ o ─ r ─ t*
+```
+
+The text is read once, one character at a time, each character moving one step in the tree.
+When no step fits, a precomputed *failure link* jumps to the longest ending of what was just read
+that is also the beginning of some keyword - from `pass` to `ss`, the start of `ssn` - so the text
+is never re-read. The cost is O(text length + total keyword length + number of hits): the number
+of keywords does not multiply the length of the text.
+
+The automaton knows nothing about words, which is why `_is_standalone` stays. In `my passn` it
+reports `ssn` at index 5; the character before it is `a`, so the hit is discarded.
+
+### 3.5 Performance
+
+`tests/test_performance.py` scans the largest text the API accepts - 1,000,000 characters of
+random words with 1,000 planted sensitive keywords - against growing Data Sets. Each test asserts
+the exact verdict and a time budget of roughly 10x the measured time, so a slow CI machine passes
+while an accidental change of complexity fails. `pytest -m performance` prints this table at the
+end of the run (one local run; the numbers move by a few milliseconds between runs):
+
+| Scenario | Size | Time |
+|----------|------|------|
+| Small policy: 1 Data Type x 5 keywords | 5 keywords | 6.4 ms |
+| Department: 10 x 50 | 500 keywords | 9.4 ms |
+| Enterprise: 50 x 200 | 10,000 keywords | 17.4 ms |
+| Validation maximum per type: 20 x 1000 | 20,000 keywords | 31.8 ms |
+| 50 Data Types sharing the same 4 frequent keywords | 903 hits per type | 8.0 ms |
+| End to end over HTTP and PostgreSQL: 5 Data Sets x 20 types x 200 keywords | load + scan | ~30 ms |
+
+Growing the Data Set 4,000-fold - from 5 keywords to 20,000 - costs about 5x, because the text is
+read once whatever the number of keywords; the remaining growth is building the automaton and
+lower-casing the patterns. The shared-keywords row shows the other half of the design: 50 Data
+Types watching the same keywords cost one pass, not fifty.
+
+Two other ways to find the keywords were measured and not used. Splitting the text into words and
+looking keywords up in a dictionary costs a fixed 40 ms per 1 MB whatever the keywords are, and
+needs a second code path for `credit card` or `c++`. One regex alternation of all keywords took
+148 ms with 400 keywords, and reports non-overlapping matches only, so `york` inside `new york` is
+not counted. The automaton is rebuilt on every call; building it for 400 keywords takes 0.09 ms,
+so it is not cached.
+
+---
+
+## 4. Data model
 
 The relationship between Data Sets and Data Types is many-to-many, so it is implemented with an
 association table rather than a single foreign key.
@@ -414,9 +678,11 @@ The two delete policies express a business decision:
 
 ---
 
-## 4. Module structure
+## 5. Module structure
 
-### 4.1 `app/models.py`
+The scan core (`policy.py`, `engines.py`) has its own section - [section 3](#3-core-logic---apppolicypy-and-appenginespy).
+
+### 5.1 `app/models.py`
 
 ```mermaid
 classDiagram
@@ -451,7 +717,7 @@ classDiagram
     dataset_data_types ..> DataType : links
 ```
 
-### 4.2 `app/schemas.py`
+### 5.2 `app/schemas.py`
 
 Each resource follows the same three-way split: `*Create` and `*Update` describe what may come
 in, `*Read` describes what goes out. `*Base` holds the fields and validators shared by the write
@@ -543,117 +809,9 @@ Set into a 500.
 `DataSetRead` is built by `from_model` rather than `from_attributes`, because the ORM
 exposes `data_types` (objects) while the contract requires `data_type_ids` (a flat array).
 
+---
 
-### 4.3 `app/matchers.py`
-
-One matcher class per inspection type. The module separates **mechanics** (how many times did a
-rule fire) from **policy** (is that enough, and how are the rules combined), and the class
-hierarchy is drawn along exactly that line.
-
-```mermaid
-classDiagram
-    class BaseMatcher {
-        <<abstract>>
-        +prepare(patterns, text, memo)
-        +count(patterns, text, memo) int*
-        +detect(data_type, text, memo) DetectedObject|None
-    }
-    class KeywordMatcher {
-        +prepare(patterns, text, memo)
-        +count(patterns, text, memo) int
-        -_count_all(patterns, text) dict~str, int~
-        -_is_standalone(text, start, end) bool
-    }
-    class Automaton {
-        <<pyahocorasick, built per scan>>
-        add_word(keyword)
-        make_automaton()
-        iter(text) hits
-    }
-    class SubstringMatcher {
-        <<future>>
-        +count(patterns, text, memo) int
-    }
-    class RegexMatcher {
-        <<future>>
-        +count(patterns, text, memo) int
-    }
-    class LlmMatcher {
-        <<future>>
-        +count(patterns, text, memo) int
-    }
-    class _MATCHERS {
-        <<dict, one instance per type>>
-        InspectionType.KEYWORDS : KeywordMatcher()
-    }
-    class module_functions {
-        <<module level>>
-        detect(data_types, text, combine) list~DetectedObject~
-        _matcher_for(data_type) BaseMatcher
-    }
-
-    BaseMatcher <|-- KeywordMatcher
-    KeywordMatcher ..> Automaton : builds once per scan
-    BaseMatcher <|-- SubstringMatcher
-    BaseMatcher <|-- RegexMatcher
-    BaseMatcher <|-- LlmMatcher
-    _MATCHERS --> KeywordMatcher : holds an instance of
-    module_functions --> _MATCHERS : looks up by data_type.type
-    module_functions --> BaseMatcher : calls prepare() then detect() on
-```
-
-**How keywords are found.** `KeywordMatcher` works in two steps. An Aho-Corasick automaton finds
-every place where a keyword occurs as a substring, and `_is_standalone` then keeps only the hits
-that are whole words. The automaton is a tree with one node per character, shared by all the
-keywords; a space or a `+` is a character like any other, so `new york` and `c++` need no special
-case. For the keywords `my`, `ssn`, `and`, `passport`:
-
-```
-(root)
-  ├─ m ─ y*                              * = a keyword ends here
-  ├─ s ─ s ─ n*
-  ├─ a ─ n ─ d*
-  └─ p ─ a ─ s ─ s ─ p ─ o ─ r ─ t*
-```
-
-The text is read once, one character at a time, each character moving one step in the tree.
-When no step fits, a precomputed *failure link* jumps to the longest ending of what was just read
-that is also the beginning of some keyword - from `pass` to `ss`, the start of `ssn` - so the text
-is never re-read. The cost is O(text length + total keyword length + number of hits): the number
-of keywords does not multiply the length of the text.
-
-The automaton knows nothing about words, which is why `_is_standalone` stays. In `my passn` it
-reports `ssn` at index 5; the character before it is `a`, so the hit is discarded.
-
-**One pass per scan.** `detect` first hands each engine all of its patterns through `prepare`.
-`KeywordMatcher.prepare` lower-cases the text, builds one automaton from the keywords of every
-Data Type, reads the text once, and leaves a `keyword -> count` dict in the scan's `memo`. `count`
-then only adds up the entries of one Data Type. The `memo` is an argument rather than an
-attribute because the matchers in `_MATCHERS` are singletons shared by all requests - state on
-`self` would leak from one scan into the next. `prepare` is optional: an engine that does not
-override it simply does all its work in `count`.
-
-Measured on a 1 MB text (best of 7 runs), against the previous one-`str.find`-pass-per-keyword
-implementation. The two were also compared on 30,000 random scans and returned identical results.
-
-| Scenario | `str.find` per keyword | Aho-Corasick |
-|----------|------------------------|--------------|
-| 1 Data Type, 4 keywords that occur often | 23.5 ms | 23.6 ms |
-| 20 Data Types, 5 keywords each, none in the text | 54.0 ms | **3.4 ms** |
-| 20 Data Types, 20 keywords each, none in the text | 217.1 ms | **3.4 ms** |
-| 20 Data Types sharing the same 4 frequent keywords | 526.0 ms | **23.9 ms** |
-| 5 Data Types, 1000 keywords each (the validation maximum) | 2946.5 ms | **4.9 ms** |
-
-The first row shows where there is no gain: with few keywords and many hits, the time is spent on
-the per-hit boundary check, which both versions perform. The automaton is rebuilt on every scan;
-building it for 400 keywords takes 0.09 ms, so it is not cached.
-
-Two alternatives were measured and rejected. Splitting the text into words and looking keywords
-up in a dictionary costs a fixed 40 ms per 1 MB whatever the keywords are, and needs a second code
-path for `credit card` or `c++`. One regex alternation of all keywords took 148 ms with 400
-keywords, and reports non-overlapping matches only, so `york` inside `new york` is not counted.
-
-## 5 Eager loading strategy
+## 6. Eager loading strategy
 
 `DataSet.data_types` is declared `lazy="joined"`. Some form of eager loading is not optional in
 this service: touching a lazily-loaded collection would emit IO from an already-returned async
@@ -763,7 +921,7 @@ statements combined.
 
 ---
 
-## 6 Deployment
+## 7. Deployment
 
 The stack is two long-running containers plus one on-demand test container, all described by
 one `docker-compose.yml` and built from one multi-stage `Dockerfile`.

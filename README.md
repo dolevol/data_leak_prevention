@@ -10,8 +10,8 @@ The project is built with FastAPI on top of PostgreSQL, is synchronous for the u
 
 ## Non-Trivial decisions that I have made:
 
-* I've decided to focus on scalability - for future matchers (regex, prefixes, llm etc.) or for future logics (AND instead of OR).
-* I've kept the modules decoupled by responsibility - `crud.py` has no HTTP knowledge and `matchers.py` has no DB knowledge - so the natural seam for splitting this into a policy-management service and a high-traffic scan microservice already exists, and neither module would need a rewrite. I'm deliberately not claiming it is "ready for microservices": an actual split would still have to solve the shared database, the `ON DELETE RESTRICT` that produces the 409, and the atomicity of creating a Data Set together with its members.
+* I've decided to focus on scalability - for future inspection engines (regex, prefixes, llm etc.) or for future logics (AND instead of OR).
+* I've kept the modules decoupled by responsibility - `crud.py` has no HTTP knowledge and the scan core (`policy.py`, `engines.py`) has no DB knowledge - so the natural seam for splitting this into a policy-management service and a high-traffic scan microservice already exists, and neither module would need a rewrite. I'm deliberately not claiming it is "ready for microservices": an actual split would still have to solve the shared database, the `ON DELETE RESTRICT` that produces the 409, and the atomicity of creating a Data Set together with its members.
 * I've interpreted "fully-sync" as for the user's experience only (waits for the response). The backend has to be async due to the DB I/O actions (to free the CPU for many future scan requests).
 * I've chosen the following delete object policy: if a user tries to delete a datatype that is used by an existing dataset - I block the action. In contrast, when a user tries to delete a dataset, it is approved. The first case is problematic because it's too powerful (might damage too many policies). I know that the best approach is to enable a soft-delete of datatypes (with a revival option), but I've found it as a lower priority at this moment.
 * I've decided to use a junction table to represent the many-to-many relationship between datasets and datatypes. Therefore, when a user tries to delete a dataset - all the dataset-datatype relations are being deleted (CASCADE).
@@ -19,13 +19,14 @@ The project is built with FastAPI on top of PostgreSQL, is synchronous for the u
 * The DB schema is created automatically at startup with "create_all". I know that a real production deployment would use Alembic instead for versioning, but it's an overkill for now (the db scheme and data are being reset all the time).
 * Docker files are heavy with in-line comments because the concept is new to me.
 * I've decided not to build a caching mechanism for DataSets/DataTypes nor a hashing & caching mechanism for Scans due to the project's scope.
-* The matching algorithm (`matchers.py`) is the result of the following decisions:
+* I split the scan core into two files that each answer one question. `engines.py` holds the **mechanics** - how often does each pattern occur in the text - and never sees a Data Type. `policy.py` holds the **policy** - which Data Types fired - and never sees how counting works. An engine is stateless (patterns and text in, counts out), so one shared instance per type is safe across requests. A new inspection type is one `Engine` subclass plus one registry entry, and an AND mode would touch only `policy.py`. The full flow, with every function's input and output, is diagrammed in ARCHITECTURE.md, section 3.
+* The matching algorithm (`engines.py`) is the result of the following decisions:
   * I count the **total occurrences** of the keywords and not the number of distinct keywords. It matches the "minimum occurrences" meaning of commercial DLP products, and the `match_count` in the response is exactly the number that was compared against the threshold.
-  * I find the keywords with the **Aho-Corasick** algorithm (the `pyahocorasick` library): all the keywords of the Data Set are built into one tree of characters, and the text is read once while walking that tree. The scan time therefore depends on the length of the text and on the number of hits, and not on the number of keywords. On a 1 MB text, 20 Data Types with 20 keywords each went from 217 ms to 3.4 ms, and the allowed maximum (5 Data Types with 1000 keywords each) from 2.9 seconds to 4.9 ms. With only a few keywords there is no gain (23.5 ms before and after).
+  * I find the keywords with the **Aho-Corasick** algorithm (the `pyahocorasick` library): all the keywords of the Data Set are built into one tree of characters, and the text is read once while walking that tree. The scan time therefore depends on the length of the text and on the number of hits, and not on the number of keywords. On the largest accepted text (1,000,000 characters), 50 Data Types with 200 keywords each scan in about 20 ms, and 20 Data Types at the 1000-keyword maximum in about 35 ms (`pytest -m performance` prints the table).
   * The algorithm finds substrings, so I then check the characters on both sides of each hit to keep only whole words. I did not use a regex for either step: there is nothing to escape, a keyword that ends with a symbol (`c++`) is handled correctly, a keyword written by a user can never become a ReDoS pattern, and a keyword contained in another one (`york` inside `new york`) is still counted.
   * An underscore is **not** part of a word. For DLP, snake_case is a separator: `ssn` must be found inside `ssn_number`.
   * The text is lower-cased and read **once per scan** for all the Data Types together, so a keyword that several Data Types share is counted once and its count is reused.
-  * The counts of a scan live in a `memo` dict that `detect` creates for that single scan and passes to the matchers. I did not keep it on the matcher object, because the matchers are shared by all requests and the state would leak from one scan into the next.
+  * The policy calls each engine **once per scan** with the patterns of all its Data Types together, then gives each Data Type the sum of its own patterns, so a keyword that several Data Types share is searched for once.
   * The tree is rebuilt on every scan and is not cached: building it for 400 keywords takes 0.09 ms, so a cache would add invalidation logic for no measurable gain.
   * I deliberately did **not** stop counting once the threshold is reached. It is much faster on a text full of hits, but `match_count` would then always equal the threshold and stop carrying information.
   * I also considered splitting the text into words and looking each keyword up in a dictionary. It needs no library, but it costs a fixed 40 ms per 1 MB even for a few keywords, and keywords such as `credit card` or `c++` need a second code path.
@@ -75,12 +76,13 @@ would use Alembic instead.
 
 ## Running the tests
 
-66 tests in two groups, selected with a pytest marker:
+73 tests, selected with pytest markers:
 
 | Marker | Files | Tests | Needs | What they prove |
 |--------|-------|-------|-------|-----------------|
-| `unit` | `test_matchers.py` | 22 | nothing | The matching rules: whole words, counting, thresholds, OR across Data Types |
+| `unit` | `test_engines.py`, `test_policy.py` | 15 + 8 | nothing | Engines: whole words, case, symbols, overlaps. Policy: thresholds, total occurrences, OR, one pass per scan |
 | `integration` | `test_datatypes.py`, `test_datasets.py`, `test_scan.py` | 20 + 11 + 13 | PostgreSQL | The HTTP contract end to end: status codes, validation, delete policies, scan verdicts |
+| `performance` | `test_performance.py` | 5 unit + 1 integration | as marked | A 1,000,000-character text against Data Sets of up to 20,000 keywords: exact verdicts within time budgets, and a results table at the end of the run |
 
 The integration suite runs against a separate `dlp_test` database, created automatically when
 the database container initialises. Each test drops and recreates the schema, so tests never
@@ -105,11 +107,12 @@ pip install -r requirements-dev.txt
 pytest -m unit           # under a second, no database, no Docker
 docker compose up -d db  # the integration tests need PostgreSQL
 pytest -v                # everything
+pytest -m performance    # the scale scenarios, with a timing table at the end
 ```
 
 The shipped image carries no test framework: the test tools live in a separate `test` stage of
 the `Dockerfile` that a production build never executes (see
-[ARCHITECTURE.md](docs/ARCHITECTURE.md#6-deployment)).
+[ARCHITECTURE.md](docs/ARCHITECTURE.md#7-deployment)).
 
 ---
 
@@ -213,7 +216,8 @@ app/
 ├── models.py       # SQLAlchemy models: DataType, DataSet, association table
 ├── schemas.py      # Pydantic schemas and every validation rule
 ├── crud.py         # internal layer: all queries, no HTTP knowledge
-├── matchers.py     # inspection logic: counting functions, thresholds, OR across Data Types
+├── policy.py       # scan POLICY: per-Data-Type thresholds, OR across Data Types
+├── engines.py      # scan MECHANICS: one stateless Engine per inspection type, counts occurrences
 └── api/
     ├── deps.py         # shared dependencies (session, pagination bounds)
     ├── datatypes.py    # router for /api/datatypes
