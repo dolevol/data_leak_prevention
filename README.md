@@ -76,11 +76,11 @@ would use Alembic instead.
 
 ## Running the tests
 
-73 tests, selected with pytest markers:
+74 tests, selected with pytest markers:
 
 | Marker | Files | Tests | Needs | What they prove |
 |--------|-------|-------|-------|-----------------|
-| `unit` | `test_engines.py`, `test_policy.py` | 15 + 8 | nothing | Engines: whole words, case, symbols, overlaps. Policy: thresholds, total occurrences, OR, one pass per scan |
+| `unit` | `test_engines.py`, `test_policy.py` | 16 + 8 | nothing | Engines: whole words, case, symbols, overlaps, one engine per inspection type. Policy: thresholds, total occurrences, OR, one pass per scan |
 | `integration` | `test_datatypes.py`, `test_datasets.py`, `test_scan.py` | 20 + 11 + 13 | PostgreSQL | The HTTP contract end to end: status codes, validation, delete policies, scan verdicts |
 | `performance` | `test_performance.py` | 5 unit + 1 integration | as marked | A 1,000,000-character text against Data Sets of up to 20,000 keywords: exact verdicts within time budgets, and a results table at the end of the run |
 

@@ -108,9 +108,9 @@ An LLM engine would additionally need a config column (for example `config JSONB
 docker compose up -d --build        # whole stack: api on :8000, db on :5432
 docker compose up -d db             # database only, for local development
 pip install -r requirements-dev.txt # runtime deps plus pytest and httpx
-pytest -v                           # 73 tests: 20 datatypes, 11 datasets, 13 scan, 15 engines, 8 policy, 6 performance
+pytest -v                           # 74 tests: 20 datatypes, 11 datasets, 13 scan, 16 engines, 8 policy, 6 performance
 pytest -m performance               # 1 MB text vs up to 20,000 keywords, prints a timing table
-pytest -m unit                      # 28 tests (engines, policy, 5 performance), no database needed
+pytest -m unit                      # 29 tests (engines, policy, 5 performance), no database needed
 docker compose run --rm --build test  # whole suite in the Dockerfile's test stage (also what CI runs)
 ```
 

@@ -7,7 +7,8 @@ hard to read from an API-level assertion.
 
 import pytest
 
-from app.engines import KeywordEngine
+from app.engines import ENGINES, KeywordEngine
+from app.models import InspectionType
 
 # Pure logic: no database, no HTTP client. Runs without Docker.
 pytestmark = pytest.mark.unit
@@ -82,3 +83,14 @@ def test_each_spelling_gets_the_count_of_its_keyword() -> None:
     spelling missing from the result would be a KeyError there.
     """
     assert KeywordEngine().find(["ssn", "SSN"], "ssn and SSN") == {"ssn": 2, "SSN": 2}
+
+
+def test_every_inspection_type_has_an_engine() -> None:
+    """The API never accepts an inspection type that the server cannot scan.
+
+    ``InspectionType`` is what the API promises (Pydantic validates against it);
+    ``ENGINES`` is what the server can run. If they drift apart, a client could
+    create a Data Type and get HTTP 500 on every scan. This turns that runtime
+    bug into a red build.
+    """
+    assert set(ENGINES) == set(InspectionType)
