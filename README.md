@@ -1,5 +1,7 @@
 # Simplified DLP Platform
 
+[![tests](https://github.com/dolevol/data_leak_prevention/actions/workflows/tests.yml/badge.svg)](https://github.com/dolevol/data_leak_prevention/actions/workflows/tests.yml)
+
 A single backend service that detects sensitive content in text. It lets you define
 **Data Types** (keyword-based inspection rules with a threshold), group them into
 **Data Sets** (policies), and scan text against them.
@@ -31,7 +33,8 @@ The project is built with FastAPI on top of PostgreSQL, is synchronous for the u
 
 ## Requirements
 
-Docker and docker-compose. Python 3.12 is needed only to develop or run the tests locally.
+Docker and docker-compose. Python is needed only to develop or to run the tests on the host:
+the images use 3.12, and the host suite was also verified on 3.14.
 
 ## Running the whole stack
 
@@ -72,18 +75,41 @@ would use Alembic instead.
 
 ## Running the tests
 
-The suite runs against a separate `dlp_test` database, created automatically when the container
-initialises:
+66 tests in two groups, selected with a pytest marker:
+
+| Marker | Files | Tests | Needs | What they prove |
+|--------|-------|-------|-------|-----------------|
+| `unit` | `test_matchers.py` | 22 | nothing | The matching rules: whole words, counting, thresholds, OR across Data Types |
+| `integration` | `test_datatypes.py`, `test_datasets.py`, `test_scan.py` | 20 + 11 + 13 | PostgreSQL | The HTTP contract end to end: status codes, validation, delete policies, scan verdicts |
+
+The integration suite runs against a separate `dlp_test` database, created automatically when
+the database container initialises. Each test drops and recreates the schema, so tests never
+depend on one another.
+
+**Inside Docker - one command, same result on any machine.** Python 3.12 and every package
+version come from the image, not from the host:
 
 ```bash
-docker compose up -d db
-pip install -r requirements-dev.txt
-pytest -v
-docker compose down # add -v for data deletion
+docker compose run --rm --build test
 ```
 
-The tests run on the host, not inside the container: the image ships runtime dependencies only,
-so it carries no test framework.
+- `--build` rebuilds the test image first. Without it compose reuses the existing image, so tests
+  edited since the last build would not be in it - a green run on old code.
+- `--rm` deletes the container when the run ends, so finished test containers do not pile up.
+- The `test` service sits in a compose profile, so a plain `docker compose up` never starts it.
+
+**On the host - fastest while developing:**
+
+```bash
+pip install -r requirements-dev.txt
+pytest -m unit           # under a second, no database, no Docker
+docker compose up -d db  # the integration tests need PostgreSQL
+pytest -v                # everything
+```
+
+The shipped image carries no test framework: the test tools live in a separate `test` stage of
+the `Dockerfile` that a production build never executes (see
+[ARCHITECTURE.md](docs/ARCHITECTURE.md#6-deployment)).
 
 ---
 

@@ -2,7 +2,11 @@
 services:
   api:
     # We build the image based on our Dockefile that sits in the same dir
-    build: .
+    build:
+      context: .
+      # Named explicitly rather than relying on "the last stage in the Dockerfile": if a
+      # stage is ever appended after runtime, the API must not silently start running it.
+      target: runtime
     container_name: dlp_api
     environment:
       # Here we connect the api container to the db container -
@@ -26,6 +30,25 @@ services:
       timeout: 3s # limit to declare a retry as failed
       retries: 5
       start_period: 5s # offset until first healthcheck after startup
+
+  # The test suite in a fixed Python 3.12, whatever the host has installed.
+  # Run it with:  docker compose run --rm --build test
+  # --build matters: without it compose reuses an existing image, and tests edited since the
+  # last build would not be in it. --rm deletes the finished container afterwards.
+  test:
+    build:
+      context: .
+      target: test
+    # A profile keeps this service out of a plain `docker compose up`: it starts only when
+    # asked for by name, so the normal stack never runs the tests by accident.
+    profiles: ["test"]
+    environment:
+      # "db", not "localhost": inside this container localhost is the test container itself.
+      # db is the service name, which Docker's internal DNS resolves to the database container.
+      TEST_DATABASE_URL: postgresql+asyncpg://dlp:dlp@db:5432/dlp_test
+    depends_on:
+      db:
+        condition: service_healthy
 
   db:
     # We download the already built image of postgres, alpine is minimalist

@@ -2,9 +2,13 @@
 
 import uuid
 
+import pytest
 from httpx import AsyncClient
 
 from tests.conftest import UNKNOWN_ID, create_data_set, create_data_type
+
+# Every test here goes through the HTTP client into a real PostgreSQL.
+pytestmark = pytest.mark.integration
 
 
 async def scan(client: AsyncClient, text: str, data_set_id: str):
@@ -110,7 +114,7 @@ async def test_matching_is_case_insensitive(client: AsyncClient) -> None:
 
 
 async def test_updating_a_data_type_changes_later_scans(client: AsyncClient) -> None:
-    """The compiled-pattern cache never serves a stale rule after an update."""
+    """A scan always reads the current rule from the database, never a stale copy."""
     data_type = await create_data_type(client, content=["alpha"], threshold=1)
     data_set = await create_data_set(client, data_type["id"])
     assert (await scan(client, "beta only", data_set["id"])).json() == {"status": "not matched"}
@@ -173,7 +177,7 @@ async def test_combine_defaults_to_or(client: AsyncClient) -> None:
 
 
 async def test_unknown_combine_value_is_rejected(client: AsyncClient) -> None:
-    """Only the two documented combine modes are accepted."""
+    """Only the documented combine mode is accepted; anything else is a 422."""
     data_type = await create_data_type(client, content=["ssn"], threshold=1)
     data_set = await create_data_set(client, data_type["id"])
 

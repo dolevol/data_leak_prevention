@@ -13,6 +13,9 @@ import pytest
 from app.matchers import KeywordMatcher, UnsupportedInspectionTypeError, detect
 from app.models import DataType, InspectionType
 
+# Pure logic: no database, no HTTP client. Runs without Docker.
+pytestmark = pytest.mark.unit
+
 
 def make_data_type(*keywords: str, name: str = "test", threshold: int = 1) -> DataType:
     """Build an unsaved Data Type for the engine to evaluate.
@@ -74,7 +77,10 @@ def test_counts_total_occurrences_not_distinct_keywords() -> None:
 
 
 def test_longer_keyword_wins_over_its_prefix() -> None:
-    """Overlapping keywords are counted once, preferring the longer one."""
+    """A keyword that is only the start of a longer word is not counted.
+
+    "pass" occurs inside "passport", but "p" follows it, so only "passport" counts.
+    """
     assert KeywordMatcher().count(["pass", "passport"], "passport") == 1
 
 

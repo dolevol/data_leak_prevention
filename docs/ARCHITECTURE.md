@@ -765,20 +765,47 @@ statements combined.
 
 ## 6 Deployment
 
-The stack is two containers described by one `docker-compose.yml`.
+The stack is two long-running containers plus one on-demand test container, all described by
+one `docker-compose.yml` and built from one multi-stage `Dockerfile`.
 
 ```mermaid
 flowchart LR
-    Host["host<br/>curl, browser, pytest"]
-    subgraph Net ["compose network"]
-        API["api container<br/>python:3.12-slim<br/>uvicorn on 0.0.0.0:8000<br/>user: appuser"]
-        DB[("db container<br/>postgres:16-alpine")]
-        API -->|"db:5432"| DB
+    Host["host<br/>curl, browser, pytest, psql"]
+    subgraph Net ["compose network - Docker DNS resolves service names"]
+        API["api container<br/>target: runtime<br/>uvicorn on 0.0.0.0:8000<br/>user: appuser"]
+        TEST["test container<br/>target: test, profile: test<br/>pytest -v, then removed"]
+        DB[("db container<br/>postgres:16-alpine<br/>databases: dlp, dlp_test")]
+        API -->|"db:5432 / dlp"| DB
+        TEST -->|"db:5432 / dlp_test"| DB
     end
-    Host -->|"localhost:8000"| API
-    Host -->|"localhost:5432<br/>tests, psql"| DB
+    Host -->|"localhost:8000<br/>published port"| API
+    Host -->|"localhost:5432<br/>published port"| DB
     DB -.->|"named volume"| V[("dlp_pgdata<br/>survives down")]
 ```
+
+**Who is `localhost`.** The word always means "this machine", so its meaning depends on who asks.
+For the host it is the host; inside the `test` container it is the `test` container itself, where
+nothing listens on 5432. Containers therefore reach each other **by service name**: compose puts
+every service on one network and runs a DNS server on it, so `db` resolves to the database
+container's address. The host has no such DNS entry; it reaches the database through the
+published port `"5432:5432"`, which forwards `localhost:5432` on the host into the `db` container.
+
+### The Dockerfile stages
+
+```
+base     python:3.12-slim + requirements.txt      shared by both stages below
+test     base + requirements-dev.txt + app/ + tests/ + pytest.ini   CMD pytest -v
+runtime  base + app/ + appuser                    CMD uvicorn - the image that ships
+```
+
+Docker builds only the stage it is asked for and the stages that one starts `FROM`. A runtime
+build never executes the test stage (verified with `--progress=plain`: only `base` and `runtime`
+steps appear), so pytest never reaches the shipped image. The compose file names the stage of each
+service (`target: runtime`, `target: test`) instead of relying on "the last stage in the file",
+so a stage appended later cannot silently replace the production image.
+
+`.dockerignore` decides what is sent to the builder, not what lands in an image: `tests/` is
+sent because the test stage copies it, and only a `COPY` puts a file into an image.
 
 Four decisions in the image are worth naming:
 
@@ -786,27 +813,30 @@ Four decisions in the image are worth naming:
   invalidates every layer after the first changed one, so with this order a code edit reuses the
   cached `pip install`; reversed, every edit would reinstall all dependencies. Verified: after
   touching `app/main.py`, the rebuild reports `CACHED` for the pip layer.
-* **Runtime dependencies only.** `requirements.txt` holds what the service runs on; when developing or testing locally we use
-  `requirements-dev.txt` instead - which pulls it in and adds pytest and httpx
-* **Non-root.** The image creates `appuser` and switches to it. Containers run as root by
-  default, which means a process that escapes starts with root on whatever it reaches.
+* **Runtime dependencies only in the shipped image.** `requirements.txt` holds what the service
+  runs on; `requirements-dev.txt` pulls it in and adds pytest, pytest-asyncio and httpx, and is
+  installed only in the test stage. Verified: `import pytest` fails inside the runtime image.
+* **Non-root.** The runtime stage creates `appuser` and switches to it. Containers run as root by
+  default, which means a process that escapes starts with root on whatever it reaches. The test
+  stage stays root: it is thrown away after one run and exposes no port.
 * **`--host 0.0.0.0`.** uvicorn defaults to `127.0.0.1`, which inside a container is the
   container's own loopback. The published port would then map to a socket nothing listens on.
 
-Two decisions in the compose file matter as much:
+Three decisions in the compose file matter as much:
 
-* **`depends_on: condition: service_healthy`** makes the API wait for PostgreSQL to accept
-  connections, not merely to start. This is what the `pg_isready` health check was always for:
-  `create_all` runs in the lifespan, so an API that boots too early dies on a refused connection.
-* **`DATABASE_URL` is overridden to `db:5432`.** Inside the compose network the service name is
-  the hostname; `localhost` would point the API at itself. The default in `app/config.py` stays
-  `localhost`, so local development needs no configuration.
+* **`depends_on: condition: service_healthy`** makes the API and the tests wait for PostgreSQL to
+  accept connections, not merely to start. `create_all` runs in the lifespan, so an API that boots
+  too early dies on a refused connection.
+* **`DATABASE_URL` and `TEST_DATABASE_URL` point at `db:5432`.** The defaults in `app/config.py`
+  and `tests/conftest.py` stay `localhost`, so running on the host needs no configuration.
+* **`profiles: ["test"]`** keeps the test service out of a plain `docker compose up`; it starts
+  only when named: `docker compose run --rm --build test`.
 
-Both containers declare a health check, so `docker compose ps` reports readiness rather than mere
-liveness. The API check uses `urllib` from the standard library, which avoids adding `curl` to the
-image for one line of work.
+Both long-running containers declare a health check, so `docker compose ps` reports readiness
+rather than mere liveness. The API check uses `urllib` from the standard library, which avoids
+adding `curl` to the image for one line of work.
 
-What is deliberately **not** here: a multi-stage build (nothing is compiled, so there is no build
-stage to discard), a migration step (`create_all` runs in the lifespan; a real deployment would
-run Alembic first), and any secret management (the database password is a literal in the compose
-file, which is fine for a local stack and would not be in production).
+What is deliberately **not** here: a migration step (`create_all` runs in the lifespan; a real
+deployment would run Alembic first), a lock file for transitive dependencies (only direct
+dependencies are pinned), and any secret management (the database password is a literal in the
+compose file, which is fine for a local stack and would not be in production).

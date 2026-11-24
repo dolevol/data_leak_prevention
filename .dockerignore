@@ -1,5 +1,6 @@
-# Everything here is excluded from the build context, which keeps the image small and
-# prevents a local file from silently ending up inside the container.
+# Everything here is left out of the build context - the files Docker sends to the builder.
+# A file that is not in the context cannot be COPYed into any stage. Note what this does NOT
+# decide: being in the context does not put a file in an image; only a COPY does that.
 .git/
 .venv/
 __pycache__/
@@ -7,8 +8,8 @@ __pycache__/
 .pytest_cache/
 .env
 
-# Not needed at runtime: the tests, the docs and the compose file itself.
-tests/
+# Not needed by any stage. docs/ also keeps docs/private/ out of every build.
+# tests/ is deliberately NOT listed: the test stage copies it, the runtime stage never does.
 docs/
 scripts/
 *.md

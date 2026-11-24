@@ -2,9 +2,13 @@
 between Data Sets and Data Types.
 """
 
+import pytest
 from httpx import AsyncClient
 
 from tests.conftest import UNKNOWN_ID, create_data_set, create_data_type
+
+# Every test here goes through the HTTP client into a real PostgreSQL.
+pytestmark = pytest.mark.integration
 
 
 async def test_create_links_existing_data_types(client: AsyncClient) -> None:

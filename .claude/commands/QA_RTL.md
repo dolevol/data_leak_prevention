@@ -1,5 +1,5 @@
 ---
-description: Apply or audit the Hebrew RTL writing rules for docs/QA.md (and Hebrew chat replies)
+description: Apply or audit the Hebrew RTL writing rules for docs/private/QA.md (and Hebrew chat replies)
 ---
 
 # כלל הכתיבה בעברית - שמירה על RTL
@@ -35,14 +35,14 @@ description: Apply or audit the Hebrew RTL writing rules for docs/QA.md (and Heb
 יש להריץ את הגלאי, שמדלג על בלוקי קוד, שורות המשך, קווים מפרידים ושורות הפרדה של טבלאות:
 
 ```bash
-python3 .claude/skills/project-workflow/scripts/check_rtl.py docs/QA.md
+python3 .claude/skills/project-workflow/scripts/check_rtl.py docs/private/QA.md
 ```
 
 הפלט מציג מספר שורה וטקסט לכל הפרה, וקוד היציאה הוא 1 כשנמצאה לפחות אחת.
 
 ## מה לעשות
 
-בהפעלה **ללא ארגומנטים**: יש להריץ את הגלאי על `docs/QA.md`, לתקן כל הפרה על ידי הוספת פתיח
+בהפעלה **ללא ארגומנטים**: יש להריץ את הגלאי על `docs/private/QA.md`, לתקן כל הפרה על ידי הוספת פתיח
 עברי או שינוי סדר, להריץ שוב לאימות, ולדווח בטבלה מה תוקן ואיפה.
 
 בהפעלה **עם ארגומנט** (נתיב קובץ): יש להחיל את התהליך על אותו קובץ בלבד.

@@ -1,6 +1,6 @@
 ---
 name: project-workflow
-description: Working style and documentation standards for this user's software projects - junior-level explanation depth, critical-mentor tone, minimal code with Google docstrings, and the README / ARCHITECTURE.md / docs/QA.md contract including the Hebrew RTL writing rules. Load at the start of any coding task, code review, refactor, or documentation update.
+description: Working style and documentation standards for this user's software projects - junior-level explanation depth, critical-mentor tone, minimal code with Google docstrings, and the README / ARCHITECTURE.md / docs/private/QA.md contract including the Hebrew RTL writing rules. Load at the start of any coding task, code review, refactor, or documentation update.
 ---
 
 # Working style and documentation standards
@@ -81,7 +81,7 @@ Diagram rules learned the hard way:
 - Avoid parentheses inside `participant ... as` aliases.
 - Any claim about performance must carry the measured numbers in a table.
 
-### docs/QA.md - Hebrew, append-only
+### docs/private/QA.md - Hebrew, append-only
 
 The running log of the user's questions and the answers, with the reasoning and the link to the
 code. **See the "Hebrew RTL rules" section below - they are mandatory.**

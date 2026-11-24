@@ -8,6 +8,9 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from tests.conftest import TEST_DATABASE_URL, UNKNOWN_ID, create_data_type, data_type_payload
 
+# Every test here goes through the HTTP client into a real PostgreSQL.
+pytestmark = pytest.mark.integration
+
 
 async def test_create_returns_201_with_generated_id(client: AsyncClient) -> None:
     """Creating a Data Type stores it and returns a server-generated id."""

@@ -1,0 +1,24 @@
+# Runs the whole test suite on every push and pull request, with the same command used locally.
+# Reusing `docker compose run` means CI needs no Python setup of its own: the test image brings
+# Python 3.12 and the pinned packages, and compose brings PostgreSQL with the dlp_test database.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The exit code of the test container becomes the exit code of this step, so a single
+      # failing test turns the run red.
+      - name: Run the test suite in Docker
+        run: docker compose run --rm --build test
+
+      # Runs even after a failure, so the database container never outlives the job.
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

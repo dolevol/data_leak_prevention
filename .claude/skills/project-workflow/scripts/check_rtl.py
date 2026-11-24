@@ -11,7 +11,7 @@ continuation lines are skipped: only the character that actually sets the direct
 a block matters.
 
 Usage:
-    python3 check_rtl.py docs/QA.md [more.md ...]
+    python3 check_rtl.py docs/private/QA.md [more.md ...]
 
 Exit code:
     0 when every checked file is clean, 1 when at least one violation was found.
@@ -71,7 +71,7 @@ def violations(path):
 
 def main():
     """Check every path given on the command line and print a report."""
-    paths = sys.argv[1:] or ["docs/QA.md"]
+    paths = sys.argv[1:] or ["docs/private/QA.md"]
     total = 0
     for path in paths:
         found = list(violations(path))

@@ -48,7 +48,7 @@ before claiming it.
 
 ## Decisions already settled - do not re-litigate without a reason
 
-Each of these is documented in `docs/QA.md` with the full reasoning and the rejected options.
+Each of these is documented in `docs/private/QA.md` with the full reasoning and the rejected options.
 
 | Area | Decision | Why |
 |------|----------|-----|
@@ -83,6 +83,11 @@ Each of these is documented in `docs/QA.md` with the full reasoning and the reje
 - A scan miss must serialize as exactly `{"status": "not matched"}` - this relies on
   `detected_objects` being nullable plus `response_model_exclude_none=True` on the route.
 
+- The `Dockerfile` has three stages: `base`, `test`, `runtime`. pytest must never reach `runtime`,
+  and compose names each service's `target` explicitly. `.dockerignore` must not exclude `tests/`.
+- Every test module declares `pytestmark = pytest.mark.unit` or `.integration`; `--strict-markers`
+  is on, so a new marker must be registered in `pytest.ini`.
+
 ## Adding an inspection type - the extension path
 
 Three edits, no caller changes:
@@ -104,6 +109,8 @@ docker compose up -d --build        # whole stack: api on :8000, db on :5432
 docker compose up -d db             # database only, for local development
 pip install -r requirements-dev.txt # runtime deps plus pytest and httpx
 pytest -v                           # 66 tests: 20 datatypes, 11 datasets, 22 matchers, 13 scan
+pytest -m unit                      # the 22 matcher tests, no database needed
+docker compose run --rm --build test  # whole suite in the Dockerfile's test stage (also what CI runs)
 ```
 
 `docker compose up -d --build` is the acceptance check. Tests run on the host against the
@@ -124,5 +131,5 @@ pytest -v                           # 66 tests: 20 datatypes, 11 datasets, 22 ma
 ## Out of scope, deliberately
 
 Rate limiting, caching of Data Sets or scan results, Alembic migrations, secret management,
-multi-stage Docker builds, and soft-delete of Data Types. Each is recorded in `docs/QA.md` with
+and soft-delete of Data Types. Each is recorded in `docs/private/QA.md` with
 the reason. Do not add them without being asked.
