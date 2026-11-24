@@ -126,21 +126,6 @@ PERFORMANCE_INPUT: dict = {}
 """The generated text and the planted keywords, registered by ``test_performance.py``."""
 
 
-def pytest_addoption(parser) -> None:
-    """Add ``--perf-report DIR``: write the performance input and output to files.
-
-    A pytest hook: pytest calls it once at startup, before collecting tests.
-
-    Args:
-        parser: pytest's command-line parser.
-    """
-    parser.addoption(
-        "--perf-report",
-        metavar="DIR",
-        help="write the generated scan text and a per-scenario input/output report to DIR",
-    )
-
-
 def pytest_terminal_summary(terminalreporter) -> None:
     """Print the performance table, and write the report files when asked to.
 

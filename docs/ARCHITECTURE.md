@@ -952,7 +952,7 @@ published port `"5432:5432"`, which forwards `localhost:5432` on the host into t
 
 ```
 base     python:3.12-slim + requirements.txt      shared by both stages below
-test     base + requirements-dev.txt + app/ + tests/ + pytest.ini   CMD pytest -v
+test     base + requirements-dev.txt + app/ + tests/ + pytest.ini + conftest.py   CMD pytest -v
 runtime  base + app/ + appuser                    CMD uvicorn - the image that ships
 ```
 
