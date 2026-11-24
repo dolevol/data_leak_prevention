@@ -110,6 +110,22 @@ pytest -v                # everything
 pytest -m performance    # the scale scenarios, with a timing table at the end
 ```
 
+**Sanity report - for showing someone the numbers are real.** The performance tests can also
+write what they generated and what came back:
+
+```bash
+pytest -m performance --perf-report perf_report
+```
+
+- `perf_report/input_text.txt` - the full 1,000,000-character text that was scanned.
+- `perf_report/report.md` - per scenario: the Data Set (input), every `match_count` returned
+  (output), the expected count next to it, and the time. The end-to-end scenario also shows the
+  raw API response.
+
+The expected counts are computed independently of the engine, and the report prints a `grep`
+command to recount any keyword in the text with a tool that has nothing to do with this service.
+The folder is gitignored.
+
 The shipped image carries no test framework: the test tools live in a separate `test` stage of
 the `Dockerfile` that a production build never executes (see
 [ARCHITECTURE.md](docs/ARCHITECTURE.md#7-deployment)).

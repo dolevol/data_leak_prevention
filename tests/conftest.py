@@ -9,6 +9,7 @@ use the test engine instead of the one configured in ``app.config``.
 
 import os
 import uuid
+from pathlib import Path
 from collections.abc import AsyncGenerator
 
 import pytest
@@ -118,12 +119,30 @@ async def create_data_set(client: AsyncClient, *data_type_ids: str, name: str = 
 UNKNOWN_ID = str(uuid.uuid4())
 """A syntactically valid UUID that is guaranteed not to exist in the database."""
 
-PERFORMANCE_RESULTS: list[tuple[str, str, str]] = []
-"""Rows appended by ``test_performance.py`` and printed once the run ends."""
+PERFORMANCE_RESULTS: list[dict] = []
+"""One entry per performance scenario, appended by ``test_performance.py``."""
+
+PERFORMANCE_INPUT: dict = {}
+"""The generated text and the planted keywords, registered by ``test_performance.py``."""
+
+
+def pytest_addoption(parser) -> None:
+    """Add ``--perf-report DIR``: write the performance input and output to files.
+
+    A pytest hook: pytest calls it once at startup, before collecting tests.
+
+    Args:
+        parser: pytest's command-line parser.
+    """
+    parser.addoption(
+        "--perf-report",
+        metavar="DIR",
+        help="write the generated scan text and a per-scenario input/output report to DIR",
+    )
 
 
 def pytest_terminal_summary(terminalreporter) -> None:
-    """Print the performance table after the test results, when any were collected.
+    """Print the performance table, and write the report files when asked to.
 
     A pytest hook: pytest calls it once, after every test has run.
 
@@ -133,5 +152,53 @@ def pytest_terminal_summary(terminalreporter) -> None:
     if not PERFORMANCE_RESULTS:
         return
     terminalreporter.section("scan performance - 1,000,000-character text")
-    for scenario, size, elapsed in PERFORMANCE_RESULTS:
-        terminalreporter.write_line(f"{scenario:<44} {size:<24} {elapsed}")
+    for row in PERFORMANCE_RESULTS:
+        terminalreporter.write_line(f"{row['scenario']:<44} {row['size']:<24} {row['elapsed']}")
+
+    report_dir = terminalreporter.config.getoption("--perf-report")
+    if report_dir:
+        written = _write_performance_report(Path(report_dir))
+        terminalreporter.write_line(f"\nsanity report written to: {written}")
+
+
+def _write_performance_report(directory: Path) -> Path:
+    """Write the scanned text and a readable input/output report for every scenario.
+
+    Args:
+        directory: Where to write; created if missing.
+
+    Returns:
+        Path: The report file.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    text_file = directory / "input_text.txt"
+    text_file.write_text(PERFORMANCE_INPUT["text"])
+
+    lines = ["# Scan performance - sanity report", "", "## Input", ""]
+    lines.append(f"- Text: {len(PERFORMANCE_INPUT['text']):,} characters, saved in full as `{text_file.name}`.")
+    lines.append("- Planted sensitive keywords (\"found\" is counted independently of the engine, by regex):")
+    lines.append("")
+    lines.append("| Keyword | Planted | Found in the final text |")
+    lines.append("|---------|---------|-------------------------|")
+    for keyword, planted in PERFORMANCE_INPUT["planted"].items():
+        lines.append(f"| `{keyword}` | {planted} | {PERFORMANCE_INPUT['found'][keyword]} |")
+    lines += ["", "Fewer are found than planted because the generated text is cut to the API's",
+              "1,000,000-character limit; every expected count below uses the found number.",
+              "", "Check any count yourself, with a tool that is not this service:", "", "```bash",
+              f"grep -oP '(?<![a-z0-9])ssn(?![a-z0-9])' {text_file} | wc -l", "```", "",
+              "Excerpt around the first `ssn`:", "", "```", PERFORMANCE_INPUT["excerpt"], "```", ""]
+
+    for row in PERFORMANCE_RESULTS:
+        lines += [f"## {row['scenario']}", "", "**Input - the Data Set:**", "", *row["data_set"], ""]
+        lines += ["**Output:**", "", "| Data Type | match_count | Expected |", "|-----------|-------------|----------|"]
+        for name, count in row["result"].items():
+            lines.append(f"| {name} | {count} | {row['expected'].get(name, '-')} |")
+        verdict = "OK - identical" if row["result"] == row["expected"] else "MISMATCH"
+        lines += ["", f"- Verdict vs expected: **{verdict}**", f"- Time: {row['elapsed']}", ""]
+        if row.get("response"):
+            lines += ["Raw API response of the first scan (detected_objects shortened):", "", "```json",
+                      row["response"], "```", ""]
+
+    report = directory / "report.md"
+    report.write_text("\n".join(lines))
+    return report

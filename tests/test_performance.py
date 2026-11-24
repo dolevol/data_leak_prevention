@@ -10,8 +10,14 @@ A results table is printed at the end of the run (see ``pytest_terminal_summary`
 in ``conftest.py``). Run only these tests with::
 
     pytest -m performance
+
+For a sanity check to show someone, ``--perf-report DIR`` also writes the full
+generated text and a per-scenario report of input, output and expected output::
+
+    pytest -m performance --perf-report perf_report
 """
 
+import json
 import random
 import re
 import string
@@ -24,7 +30,7 @@ from httpx import AsyncClient
 from app.constants import MAX_SCAN_TEXT_LENGTH
 from app.models import DataType, InspectionType
 from app.policy import evaluate
-from tests.conftest import PERFORMANCE_RESULTS, create_data_set, create_data_type
+from tests.conftest import PERFORMANCE_INPUT, PERFORMANCE_RESULTS, create_data_set, create_data_type
 
 pytestmark = pytest.mark.performance
 
@@ -97,6 +103,42 @@ def expected_count(keyword: str) -> int:
     return len(re.findall(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", TEXT))
 
 
+def register_input() -> None:
+    """Hand the generated text to the report writer in ``conftest.py`` (once per run)."""
+    if PERFORMANCE_INPUT:
+        return
+    first = TEXT.index(" ssn ")
+    PERFORMANCE_INPUT.update(
+        text=TEXT,
+        planted=PLANTED,
+        found={keyword: expected_count(keyword) for keyword in PLANTED},
+        excerpt="..." + TEXT[max(first - 120, 0):first + 125] + "...",
+    )
+
+
+def describe(data_types: list[DataType], shown: int = 3) -> list[str]:
+    """Summarise a Data Set for the report: its size and its first few Data Types."""
+    noun = "Data Type" if len(data_types) == 1 else "Data Types"
+    lines = [f"- {len(data_types)} {noun} x {len(data_types[0].content)} keywords each"]
+    for data_type in data_types[:shown]:
+        sample = ", ".join(f"`{keyword}`" for keyword in data_type.content[:4])
+        more = len(data_type.content) - 4
+        lines.append(f"- {data_type.name} (threshold {data_type.threshold}): {sample}"
+                     + (f" ... and {more} more" if more > 0 else ""))
+    if len(data_types) > shown:
+        lines.append(f"- ... and {len(data_types) - shown} more Data Types")
+    return lines
+
+
+def record(scenario: str, size: str, elapsed: str, data_types: list[DataType],
+           result: dict, expected: dict, response: str = "") -> None:
+    """Append one scenario to the table and the optional report."""
+    register_input()
+    PERFORMANCE_RESULTS.append({"scenario": scenario, "size": size, "elapsed": elapsed,
+                                "data_set": describe(data_types), "result": result,
+                                "expected": expected, "response": response})
+
+
 SCENARIOS = {
     # name: (data types, keywords each, every n-th is sensitive, budget in seconds)
     "Small policy: 1 x 5": (1, 5, 1, 0.5),
@@ -123,10 +165,11 @@ def test_scan_core_on_the_largest_text(name: str) -> None:
         for data_type in data_types
         if data_type.content[0] in PLANTED
     }
-    assert {d.name: d.match_count for d in detections} == expected
-
+    result = {d.name: d.match_count for d in detections}
     keywords = data_type_count * keywords_each
-    PERFORMANCE_RESULTS.append((name, f"{keywords:,} keywords", f"{elapsed * 1000:.1f} ms"))
+    record(name, f"{keywords:,} keywords", f"{elapsed * 1000:.1f} ms", data_types, result, expected)
+
+    assert result == expected
     assert elapsed < budget
 
 
@@ -140,9 +183,12 @@ def test_many_data_types_sharing_frequent_keywords() -> None:
     detections = evaluate(data_types, TEXT)
     elapsed = time.perf_counter() - started
 
-    assert len(detections) == 50
-    assert all(detection.match_count == total for detection in detections)
-    PERFORMANCE_RESULTS.append(("Shared: 50 x 4 frequent", f"{total:,} hits per type", f"{elapsed * 1000:.1f} ms"))
+    result = {d.name: d.match_count for d in detections}
+    expected = {data_type.name: total for data_type in data_types}
+    record("Shared: 50 x 4 frequent", f"{total:,} hits per type", f"{elapsed * 1000:.1f} ms",
+           data_types, result, expected)
+
+    assert result == expected
     assert elapsed < 1.0
 
 
@@ -150,13 +196,14 @@ def test_many_data_types_sharing_frequent_keywords() -> None:
 async def test_end_to_end_scan_of_the_largest_text(client: AsyncClient) -> None:
     """Through HTTP and PostgreSQL: 5 Data Sets over 40 shared Data Types, 1 MB scanned each."""
     planted = list(PLANTED)
-    data_type_ids = []
+    data_type_ids, data_types = [], []
     for index in range(40):
         keywords = absent_keywords(200, f"api{index}k")
         if index % 10 == 0:
             keywords[0] = planted[index // 10]
         body = await create_data_type(client, name=f"API rule {index}", content=keywords, threshold=1)
         data_type_ids.append(body["id"])
+        data_types.append(make_data_type(body["name"], keywords))
 
     # Five overlapping Data Sets: each reuses 20 of the 40 Data Types.
     data_sets = [
@@ -164,15 +211,24 @@ async def test_end_to_end_scan_of_the_largest_text(client: AsyncClient) -> None:
         for start in range(0, 25, 5)
     ]
 
-    timings = []
+    timings, bodies = [], []
     for data_set in data_sets:
         started = time.perf_counter()
         response = await client.post("/api/scan", json={"text": TEXT, "data_set_id": data_set["id"]})
         timings.append(time.perf_counter() - started)
         assert response.status_code == 200
-        assert response.json()["status"] == "match"
+        bodies.append(response.json())
 
-    PERFORMANCE_RESULTS.append(
-        ("End to end: 5 Data Sets x 20 types x 200", "HTTP + DB load + scan", f"{max(timings) * 1000:.1f} ms (slowest)")
-    )
+    # Report the first Data Set (members 0-19): its planted members are rules 0 and 10.
+    first = bodies[0]
+    result = {d["name"]: d["match_count"] for d in first["detected_objects"]}
+    expected = {data_type.name: expected_count(data_type.content[0])
+                for data_type in data_types[:20] if data_type.content[0] in PLANTED}
+    shown = {**first, "detected_objects": [{**d, "id": d["id"][:8] + "..."} for d in first["detected_objects"]]}
+    record("End to end: 5 Data Sets x 20 types x 200", "HTTP + DB load + scan",
+           f"{max(timings) * 1000:.1f} ms (slowest)", data_types[:20], result, expected,
+           response=json.dumps(shown, indent=2))
+
+    assert all(body["status"] == "match" for body in bodies)
+    assert result == expected
     assert max(timings) < 2.0
