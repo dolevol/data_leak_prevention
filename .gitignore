@@ -7,5 +7,5 @@ __pycache__/
 # Private learning notes: quiz results and weak spots stay off the public repo.
 docs/private/
 
-# Output of `pytest -m performance --perf-report perf_report` (1 MB text + report).
-perf_report/
+# Output of `pytest -m performance --perf-report` (1 MB text + report).
+tests/perf_report/

@@ -142,7 +142,9 @@ def pytest_terminal_summary(terminalreporter) -> None:
 
     report_dir = terminalreporter.config.getoption("--perf-report")
     if report_dir:
-        written = _write_performance_report(Path(report_dir))
+        # A relative DIR is taken from the project root, so the report lands in the
+        # same place whichever folder pytest was started from.
+        written = _write_performance_report(terminalreporter.config.rootpath / report_dir)
         terminalreporter.write_line(f"\nsanity report written to: {written}")
 
 

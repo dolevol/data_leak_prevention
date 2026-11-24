@@ -110,7 +110,7 @@ docker compose up -d db             # database only, for local development
 pip install -r requirements-dev.txt # runtime deps plus pytest and httpx
 pytest -v                           # 74 tests: 20 datatypes, 11 datasets, 13 scan, 16 engines, 8 policy, 6 performance
 pytest -m performance               # 1 MB text vs up to 20,000 keywords, prints a timing table
-pytest -m performance --perf-report perf_report  # also writes the input text + input/output report (gitignored)
+pytest -m performance --perf-report # also writes the input text + input/output report to tests/perf_report (gitignored)
 pytest -m unit                      # 29 tests (engines, policy, 5 performance), no database needed
 docker compose run --rm --build test  # whole suite in the Dockerfile's test stage (also what CI runs)
 ```

@@ -22,5 +22,9 @@ def pytest_addoption(parser) -> None:
     parser.addoption(
         "--perf-report",
         metavar="DIR",
-        help="write the generated scan text and a per-scenario input/output report to DIR",
+        # Given alone, the flag writes next to the tests; a DIR after it overrides that.
+        nargs="?",
+        const="tests/perf_report",
+        help="write the generated scan text and a per-scenario input/output report "
+        "to DIR (default: tests/perf_report)",
     )

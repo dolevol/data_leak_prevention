@@ -14,7 +14,7 @@ in ``conftest.py``). Run only these tests with::
 For a sanity check to show someone, ``--perf-report DIR`` also writes the full
 generated text and a per-scenario report of input, output and expected output::
 
-    pytest -m performance --perf-report perf_report
+    pytest -m performance --perf-report        # writes to tests/perf_report/
 """
 
 import json

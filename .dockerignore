@@ -10,6 +10,8 @@ __pycache__/
 
 # Not needed by any stage. docs/ also keeps docs/private/ out of every build.
 # tests/ is deliberately NOT listed: the test stage copies it, the runtime stage never does.
+# Its generated performance report is local output only (1 MB), so it stays out.
+tests/perf_report/
 docs/
 scripts/
 *.md
