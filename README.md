@@ -49,6 +49,33 @@ docker compose up -d --build
 Interactive documentation (Swagger UI) is served at http://127.0.0.1:8000/docs, and the liveness
 probe at http://127.0.0.1:8000/health.
 
+## Demo from zero
+
+**1. Install Docker** (once per machine):
+
+- macOS / Windows: install Docker Desktop from https://docs.docker.com/get-docker/ and start it.
+- Linux: `curl -fsSL https://get.docker.com | sh`, then `sudo usermod -aG docker $USER` and log in again.
+
+```bash
+docker --version          # the engine is installed
+docker compose version    # the compose plugin is installed
+```
+
+**2. Get the code and run the demo:**
+
+```bash
+git clone https://github.com/dolevol/data_leak_prevention.git
+cd data_leak_prevention
+./scripts/demo.sh           # build, start, and walk the whole API with curl
+./scripts/demo.sh --tests   # ...and finish with the full test suite in Docker
+./scripts/demo.sh --fresh   # start from an empty database (deletes local data)
+```
+
+The script prints every command before running it, then the HTTP status and the response:
+health check, two Data Types, a Data Set, a scan that matches (both rules, OR), a scan that does
+not (whole words only), a 422 on an invalid threshold, the 409 that protects a Data Type in use,
+and the clean-up. Every printed `curl` command can be copied and run on its own.
+
 ## Running the service locally instead
 
 Useful while developing, because `--reload` restarts on every edit. Only the database runs in
@@ -242,6 +269,7 @@ app/
     └── scan.py         # router for /api/scan
 tests/              # pytest suite running against a real database
 docs/               # ARCHITECTURE.md
+scripts/            # demo.sh (the interview walkthrough), init_test_db.sql (creates dlp_test)
 ```
 
 ## Further documentation
