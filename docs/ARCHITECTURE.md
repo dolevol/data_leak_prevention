@@ -854,12 +854,12 @@ the wire once instead of once per member.
 -- 1
 SELECT data_sets.id, data_sets.name
 FROM data_sets ORDER BY data_sets.name
-LIMIT $1 OFFSET $2                         -- params (0,2)     
+LIMIT $1 OFFSET $2                         -- params (2, 0): LIMIT 2, OFFSET 0
 
 -- 2
 SELECT data_sets_1.id, data_types.* ...
 FROM data_sets AS data_sets_1 JOIN ... JOIN ...
-WHERE data_sets_1.id IN ($1, $2)                -- The 2 params from Query 1
+WHERE data_sets_1.id IN ($1, $2)           -- the 2 ids that query 1 returned, sent as values
 ORDER BY data_types.name
 ```
 
